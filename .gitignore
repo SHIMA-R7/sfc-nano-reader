@@ -1,0 +1,17 @@
+# ROMダンプ・カートリッジの著作物データは一切コミットしない
+*.sfc
+*.smc
+*.bin
+host/dumps/
+host/*.bin
+host/__pycache__/
+*.pyc
+
+# 診断用の一時ファイル
+host/merge_check_lines.txt
+host/weak_bank_lines.txt
+
+# Arduino build artifacts
+build/
+*.hex
+*.elf
