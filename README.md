@@ -67,7 +67,8 @@ python gui/sfc_dumper_gui.py
   1. **自動判定** — 1バンクだけ読んでヘッダからLoROM/HiROM・サイズ・タイトルを認識
   2. **手動** — バンク数とマッピングを直接入力
   3. **データベース検索** — タイトル名で検索して正確なバイト数を引く（後述）
-- **チェックサムが一致するまで自動でダンプを繰り返し、バイト単位の多数決でマージ**
+- **チェックサムが一致するまで自動でダンプを繰り返し、複数サンプルをマージ**
+  （ビットOR → 多数決 の順に試す。理由は後述の「読み取り誤りはビット落ちの一方向だった」）
 
 ### CLI
 
@@ -75,7 +76,7 @@ python gui/sfc_dumper_gui.py
 # 単発ダンプ
 python host/receive.py COM12 2097152 dump.bin
 
-# チェックサムが合うまで繰り返して多数決マージ
+# チェックサムが合うまで繰り返してマージ（OR → 多数決）
 python host/dump_until_valid.py --port COM12 --banks 32 --mapping hirom --out MyGame.sfc
 ```
 
