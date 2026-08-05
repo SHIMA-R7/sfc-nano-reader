@@ -2,9 +2,13 @@
 *.sfc
 *.smc
 *.bin
+*.besteffort
+*.unverified
 host/dumps/
-host/*.bin
-host/__pycache__/
+*.work/
+
+# Python
+__pycache__/
 *.pyc
 
 # 診断用の一時ファイル
@@ -15,3 +19,6 @@ host/weak_bank_lines.txt
 build/
 *.hex
 *.elf
+
+# docs/ のスクリーンショットはREADMEで使うので除外しない
+!docs/*.png
