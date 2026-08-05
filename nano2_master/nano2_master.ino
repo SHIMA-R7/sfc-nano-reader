@@ -28,8 +28,15 @@ const uint8_t ADDR_RESET_PIN = 10; // Nano-1のアドレスカウンタを0に�
 #include <U8x8lib.h>
 U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 11, /*reset=*/ U8X8_PIN_NONE);
 
-const uint32_t NUM_BANKS = 32; // Super Mario Collection: HiROM 2MB = 32バンク x 64KB(ミラーなし、フル使用)
+// バンク単位モード:
+//   長時間連続で読み続けると読み取りが化ける（同じバンクでも全体ダンプ中は毎回700バイト前後
+//   誤るのに、単独で読めば2回とも完全一致する）。そこで1回の起動につき1バンクだけ読む。
+//   PC側が起動ごとに「読みたいバンク番号」を1バイト送ってくる。
 const uint32_t BANK_SIZE = 65536UL;
+
+// 読み出しタイミングの実験用パラメータ
+const uint16_t RD_SETTLE_US = 100;   // /RDアサート後にデータを読むまでの待ち
+const uint16_t ADDR_SETTLE_US = 100; // アドレス更新後の待ち
 
 void setDataPinsInput() {
   for (uint8_t i = 0; i < 6; i++) pinMode(DATA_LOW_PINS[i], INPUT);
@@ -58,7 +65,7 @@ void pulseStrobe() {
   digitalWrite(STROBE_PIN, HIGH);
   delayMicroseconds(50);
   digitalWrite(STROBE_PIN, LOW);
-  delayMicroseconds(100); // Nano-1側の16本分のdigitalWrite完了を待つマージン
+  delayMicroseconds(ADDR_SETTLE_US); // Nano-1側の16本分のdigitalWrite完了を待つマージン
 }
 
 void resetNano3Bank() {
@@ -113,7 +120,7 @@ void splashScreen() {
 uint8_t readByte() {
   digitalWrite(ROMSEL_PIN, LOW);
   digitalWrite(RD_PIN, LOW);
-  delayMicroseconds(100); // 長い配線の寄生容量を考慮して大きめに確保
+  delayMicroseconds(RD_SETTLE_US); // 長い配線の寄生容量を考慮して大きめに確保
   uint8_t v = readDataBus();
   digitalWrite(RD_PIN, HIGH);
   digitalWrite(ROMSEL_PIN, HIGH);
@@ -136,22 +143,27 @@ void setup() {
   oled.drawString(0, 2, "waiting PC...");
 
   Serial.begin(250000);
-  delay(3000); // PC側スクリプトがポートを開いて受信準備するまでの猶予
-  resetNano1Addr();
-  resetNano3Bank();
+  delay(50);
+
+  // PC側から「読みたいバンク番号」を1バイト受け取る。
+  // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
+  oled.drawString(0, 2, "waiting bank..");
+  Serial.write('R');
+  while (Serial.available() == 0) { /* 待機 */ }
+  uint8_t target = (uint8_t)Serial.read();
 
   char line[17];
-  for (uint32_t bank = 0; bank < NUM_BANKS; bank++) {
-    if (bank > 0) pulseBankStrobe(); // bankは常に+1ずつ進むのでパルス1回で足りる
-    // 検証済み: OLEDの更新は読み取り誤りの原因ではない（無効にしても誤り率は変わらなかった）。
-    // 逆に更新後にdelayを入れると悪化したので、素直にその場で描画する。
-    snprintf(line, sizeof(line), "Bank %2lu/%2lu", (unsigned long)(bank + 1), (unsigned long)NUM_BANKS);
-    oled.drawString(0, 2, line);
-    for (uint32_t a = 0; a < BANK_SIZE; a++) {
-      uint8_t b = readByte();
-      Serial.write(b);
-      pulseStrobe(); // 読んだ直後に次のアドレスへ進める
-    }
+  snprintf(line, sizeof(line), "Bank %3u      ", (unsigned)target);
+  oled.drawString(0, 2, line);
+
+  resetNano1Addr();
+  resetNano3Bank();
+  for (uint16_t b = 0; b < target; b++) pulseBankStrobe(); // 目的のバンクまで進める
+
+  for (uint32_t a = 0; a < BANK_SIZE; a++) {
+    uint8_t v = readByte();
+    Serial.write(v);
+    pulseStrobe(); // 読んだ直後に次のアドレスへ進める
   }
 
   oled.drawString(0, 2, "DONE          ");

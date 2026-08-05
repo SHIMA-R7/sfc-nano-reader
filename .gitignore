@@ -25,3 +25,7 @@ build/
 
 # 作業ログ（一時ファイル）
 host/mario_progress.txt
+
+# バンクキャッシュ
+*.banks/
+host/test_banks/
