@@ -169,13 +169,35 @@ def default_rdb_paths():
     return [p for p in candidates if os.path.exists(p)]
 
 
+_ROMAN = {
+    "i": "1", "ii": "2", "iii": "3", "iv": "4", "v": "5",
+    "vi": "6", "vii": "7", "viii": "8", "ix": "9", "x": "10",
+}
+
+
+def _normalize(s):
+    """比較用に英数字だけを残して小文字化し、ローマ数字をアラビア数字に揃える。
+
+    カート側から読めるタイトルはヘッダの制約で大文字・スペース詰めなし
+    （例: "MARIOPAINT"）だが、.rdbのタイトルは通常表記（例: "Mario Paint"）
+    なので、素の部分一致では絶対に当たらない。空白や記号を無視して比較する。
+
+    さらにカートは "FINAL FANTASY 4" と書くのに .rdb は "Final Fantasy IV" と
+    書くので、単独のローマ数字トークンは数字に置き換えてから比較する。
+    両側に同じ変換をかけるため、"I" が代名詞のような紛らわしい場合でも
+    食い違いは生じない。
+    """
+    words = "".join(c if c.isalnum() else " " for c in s.lower()).split()
+    return "".join(_ROMAN.get(w, w) for w in words)
+
+
 def search(entries, query, limit=50):
-    """部分一致・大文字小文字無視でタイトル検索する。"""
-    q = query.lower().strip()
+    """部分一致・大文字小文字無視・空白記号無視でタイトル検索する。"""
+    q = _normalize(query)
     if not q:
         return []
-    hits = [e for e in entries if q in e["name"].lower()]
-    hits.sort(key=lambda e: (not e["name"].lower().startswith(q), e["name"]))
+    hits = [e for e in entries if q in _normalize(e["name"])]
+    hits.sort(key=lambda e: (not _normalize(e["name"]).startswith(q), e["name"]))
     return hits[:limit]
 
 
