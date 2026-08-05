@@ -129,6 +129,21 @@ def majority_merge(samples):
     return bytes(merged), disputed
 
 
+def or_merge(samples):
+    """全サンプルのビットORを取る。
+
+    実測すると、このリーダーの読み取り誤りは「本来1のビットが0に落ちる」方向にしか
+    起きない（ROMが一瞬バスを駆動しきれず0で読まれる）。そのためORが真の値に単調に
+    近づく。多数決はビット落ちが多数派になった位置で誤った値に固定されるため収束しない。
+    """
+    n = len(samples[0])
+    merged = bytearray(samples[0])
+    for s in samples[1:]:
+        for i in range(n):
+            merged[i] |= s[i]
+    return bytes(merged)
+
+
 # ---------------------------------------------------------------- GUI
 
 class DumperApp(tk.Tk):
@@ -222,7 +237,7 @@ class DumperApp(tk.Tk):
         ttk.Button(dump, text="参照...", command=self.choose_output).grid(row=2, column=4, padx=6)
 
         self.repeat_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(dump, text="チェックサムが一致するまで繰り返して多数決マージ",
+        ttk.Checkbutton(dump, text="チェックサムが一致するまで繰り返してマージ（OR / 多数決）",
                         variable=self.repeat_var).grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=4)
 
         btns = ttk.Frame(dump)
@@ -540,25 +555,34 @@ class DumperApp(tk.Tk):
                 self.log(f"自動判定: {mapping.upper()}")
 
             roms = [extract_rom(r, mapping) for r in self.samples]
-            if len(roms) == 1:
-                merged, disputed = roms[0], 0
-            else:
-                self.status_var.set("マージ中...")
-                merged, disputed = majority_merge(roms)
+            self.status_var.set("マージ中...")
 
-            ok, computed, expected = verify_checksum(merged, mapping)
-            self.log(f"サンプル{len(roms)}個 / 不一致バイト{disputed} / "
-                     f"計算値={hex(computed) if computed is not None else 'NA'} "
-                     f"期待値={hex(expected) if expected is not None else 'NA'} → "
-                     f"{'一致' if ok else '不一致'}")
+            # ビット落ち方向の誤りが主なのでORを先に試し、駄目なら多数決も見る。
+            candidates = [("OR", or_merge(roms))]
+            disputed = 0
+            if len(roms) > 1:
+                maj, disputed = majority_merge(roms)
+                candidates.append(("多数決", maj))
 
-            if ok:
+            hit = None
+            for label, cand in candidates:
+                ok, computed, expected = verify_checksum(cand, mapping)
+                self.log(f"[{label}] サンプル{len(roms)}個 / 不一致バイト{disputed} / "
+                         f"計算値={hex(computed) if computed is not None else 'NA'} "
+                         f"期待値={hex(expected) if expected is not None else 'NA'} → "
+                         f"{'一致' if ok else '不一致'}")
+                if ok and hit is None:
+                    hit = (label, cand)
+
+            if hit:
+                label, merged = hit
                 with open(out, "wb") as f:
                     f.write(merged)
-                self.log(f"完了: {out} ({len(merged)} bytes) を保存しました。")
+                self.log(f"完了: {label}マージで一致。{out} ({len(merged)} bytes) を保存しました。")
                 self.after(0, lambda: messagebox.showinfo(
-                    "ダンプ成功", f"チェックサム一致。\n{out}"))
+                    "ダンプ成功", f"チェックサム一致（{label}マージ）。\n{out}"))
                 return
+            merged = candidates[0][1]
 
             if not repeat:
                 path = out + ".unverified"

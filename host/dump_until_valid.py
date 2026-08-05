@@ -104,6 +104,21 @@ def majority_merge(samples):
     return bytes(merged), disputed
 
 
+def or_merge(samples):
+    """全サンプルのビットORを取る。
+
+    実測すると、このリーダーの読み取り誤りは「本来1のビットが0に落ちる」方向にしか
+    起きない（ROMが一瞬バスを駆動しきれず、そのビットが0で読まれる）。
+    そのためORを取ると真の値に単調に近づく。多数決より圧倒的に速く収束する。
+    """
+    n = len(samples[0])
+    merged = bytearray(samples[0])
+    for s in samples[1:]:
+        for i in range(n):
+            merged[i] |= s[i]
+    return bytes(merged)
+
+
 def main():
     args = parse_args()
     work = args.work or (args.out + ".work")
@@ -126,16 +141,30 @@ def main():
     for round_no in range(1, args.max_rounds + 1):
         if raws:
             roms = [extract_rom(r, args.mapping) for r in raws]
-            merged, disputed = majority_merge(roms) if len(roms) > 1 else (roms[0], 0)
-            ok, computed, expected = verify(merged, args.mapping)
-            print(f"[判定] サンプル{len(raws)}個 / 不一致バイト{disputed} / "
-                  f"計算値={hex(computed) if computed is not None else 'NA'} "
-                  f"期待値={hex(expected) if expected is not None else 'NA'} -> "
-                  f"{'一致' if ok else '不一致'}", flush=True)
-            if ok:
+            # OR を先に試す。誤りがビット落ち方向のみなので通常はこちらが当たる。
+            candidates = [("OR", or_merge(roms))]
+            if len(roms) > 1:
+                maj, disputed = majority_merge(roms)
+                candidates.append(("多数決", maj))
+            else:
+                disputed = 0
+
+            hit = None
+            for label, cand in candidates:
+                ok, computed, expected = verify(cand, args.mapping)
+                print(f"[判定/{label}] サンプル{len(raws)}個 / 不一致バイト{disputed} / "
+                      f"計算値={hex(computed) if computed is not None else 'NA'} "
+                      f"期待値={hex(expected) if expected is not None else 'NA'} -> "
+                      f"{'一致' if ok else '不一致'}", flush=True)
+                if ok and hit is None:
+                    hit = (label, cand)
+
+            if hit:
+                label, merged = hit
                 with open(args.out, "wb") as f:
                     f.write(merged)
-                print(f"成功: {args.out} ({len(merged)} bytes) を保存しました。", flush=True)
+                print(f"成功: {label}マージで一致。{args.out} ({len(merged)} bytes) を保存しました。",
+                      flush=True)
                 return 0
 
         idx = len(raws) + 1
