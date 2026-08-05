@@ -84,6 +84,11 @@ CICロックアウトチップは**一切関係ありません**。ROMを直接�
 
 ### GUIアプリ（推奨）
 
+**[最新版の実行ファイルをダウンロード（Releases）](https://github.com/SHIMA-R7/sfc-nano-reader/releases/latest)**
+— Windows向け単一exe。Pythonのインストール不要です。
+
+ソースから動かす場合:
+
 ```bash
 python gui/sfc_dumper_gui.py
 ```
