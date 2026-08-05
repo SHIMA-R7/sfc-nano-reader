@@ -32,3 +32,10 @@ host/test_banks/
 
 # 動作確認用スクリーンショット(一時)
 mario_screenshot.png
+
+# ビルド成果物（Releasesで配布するのでgitには含めない）
+dist/
+build/
+*.spec
+exe_test*.png
+yakouchuu_screenshot.png

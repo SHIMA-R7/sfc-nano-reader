@@ -34,6 +34,13 @@ U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 11, /*reset=*/ U8
 //   PC側が起動ごとに「読みたいバンク番号」を1バイト送ってくる。
 const uint32_t BANK_SIZE = 65536UL;
 
+// PC側がシリアルポートを開くたびDTRでリセットがかかるため、放っておくと
+// 1バンクごとに起動演出が流れる（64バンク×2回=128回）。
+// SRAMの内容はリセットでは保持され、電源を切ると失われる。この性質を使って
+// 「電源を入れた最初の1回」だけ演出を出す。.noinit なので初期化されない。
+__attribute__((section(".noinit"))) uint32_t bootMagic;
+const uint32_t BOOT_MAGIC = 0x5FC0DEADUL;
+
 // 読み出しタイミングの実験用パラメータ
 const uint16_t RD_SETTLE_US = 5;   // /RDアサート後にデータを読むまでの待ち
 const uint16_t ADDR_SETTLE_US = 5; // アドレス更新後の待ち
@@ -133,7 +140,13 @@ void setup() {
   setDataPinsInput();
 
   oled.begin();
-  splashScreen();
+  const bool coldBoot = (bootMagic != BOOT_MAGIC);
+  bootMagic = BOOT_MAGIC;
+  if (coldBoot) {
+    splashScreen();   // 電源投入時のみ
+  } else {
+    oled.clear();     // リセット時は静かに立ち上げる
+  }
   oled.setFont(u8x8_font_chroma48medium8_r);
   oled.drawString(0, 0, "SFC DUMPER");
   oled.drawString(0, 2, "waiting PC...");

@@ -13,6 +13,8 @@ import subprocess
 import sys
 import threading
 import time
+import binascii
+import zlib
 import tkinter as tk
 from collections import Counter
 from tkinter import filedialog, messagebox, ttk
@@ -26,9 +28,14 @@ except ImportError:
 import rdb
 
 BANK_SIZE = 65536
-DEFAULT_BAUD = 250000
+DEFAULT_BAUD = 1000000
 
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# PyInstallerでexe化すると __file__ は一時展開先を指すので、
+# 出力先の既定値には「exe自身の置き場所」を使う。
+if getattr(sys, "frozen", False):
+    PROJECT_ROOT = os.path.dirname(sys.executable)
+else:
+    PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SKETCHES = {
     "Nano-1 (アドレス A0-A15)": os.path.join(PROJECT_ROOT, "nano1_addr_low"),
     "Nano-2 (マスタ / データ)": os.path.join(PROJECT_ROOT, "nano2_master"),
@@ -60,12 +67,19 @@ def find_arduino_cli():
 # ---------------------------------------------------------------- ROM 解析
 
 def extract_rom(raw, mapping):
-    """生ダンプからROM本体を取り出す。LoROMはバンク後半がミラーなので捨てる。"""
+    """生の64KB×Nバンクから、ROM本体を取り出す。
+
+    LoROMではROMは各バンクの $8000-$FFFF にしか現れない。カートによっては下位32KBが
+    上位のミラーになる（Super Puyo Puyo, Super Mario World）が、下位が一切駆動されず
+    0x00 で読めるカートもある（Super Mario Collection, 夜光虫）。
+    **上位32KBを採るのが常に正しい。**
+    """
     if mapping == "hirom":
         return raw
     out = bytearray()
+    half = BANK_SIZE // 2
     for i in range(0, len(raw), BANK_SIZE):
-        out += raw[i:i + BANK_SIZE // 2]
+        out += raw[i + half:i + BANK_SIZE]
     return bytes(out)
 
 
@@ -78,34 +92,35 @@ def read_header(rom, off):
     rom_size_byte = rom[off + 0x17]
     complement = rom[off + 28] | (rom[off + 29] << 8)
     checksum = rom[off + 30] | (rom[off + 31] << 8)
-    if ((checksum + complement) & 0xFFFF) != 0xFFFF:
-        return None
-    if checksum == 0:
+    if ((checksum + complement) & 0xFFFF) != 0xFFFF or checksum == 0:
         return None
     printable = sum(1 for b in title if 0x20 <= b < 0x7F)
-    if printable < 4:
-        return None
     return {
-        "title": title.decode("ascii", errors="replace").strip(),
+        "title": title.decode("shift_jis", errors="replace").strip(),
         "map_mode": map_mode,
         "size_kb": 1 << rom_size_byte if rom_size_byte < 20 else None,
         "checksum": checksum,
-        "complement": complement,
+        "printable": printable,
     }
 
 
-def detect_mapping(raw_one_bank):
-    """1バンク分の生データから (mapping, header) を推定する。"""
-    lo = read_header(raw_one_bank, 0x7FC0)
-    hi = read_header(raw_one_bank, 0xFFC0)
-    if hi and not lo:
-        return "hirom", hi
-    if lo and not hi:
-        return "lorom", lo
-    if lo and hi:
-        # 両方それらしい場合は map_mode バイトで判断（0x21/0x30台がHiROM系）
-        return ("hirom", hi) if (hi["map_mode"] & 0x01) else ("lorom", lo)
-    return None, None
+def detect_mapping(raw_bank0):
+    """バンク0の生データ(64KB)から (mapping, header) を判定する。
+
+    ヘッダの map_mode バイトだけを見ると誤りやすいので、まず下位32KBの状態で決める。
+    LoROMではROMが $8000-$FFFF にしか出ないため、下位32KBは
+    「上位のミラー」か「まったく駆動されず0x00」のどちらかになる。
+    HiROMは64KBフルに別データが載る。
+    """
+    lo = raw_bank0[:BANK_SIZE // 2]
+    hi = raw_bank0[BANK_SIZE // 2:]
+    hdr = read_header(raw_bank0, 0xFFC0)
+
+    if lo == hi:
+        return "lorom", hdr, "下位32KBが上位のミラー"
+    if not any(lo):
+        return "lorom", hdr, "下位32KBが全て0x00（駆動されていない）"
+    return "hirom", hdr, "下位32KBに独自データあり"
 
 
 def verify_checksum(rom, mapping):
@@ -237,7 +252,7 @@ class DumperApp(tk.Tk):
         ttk.Button(dump, text="参照...", command=self.choose_output).grid(row=2, column=4, padx=6)
 
         self.repeat_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(dump, text="チェックサムが一致するまで繰り返してマージ（OR / 多数決）",
+        ttk.Checkbutton(dump, text="各バンクを2回読んで一致するまで繰り返す（推奨）",
                         variable=self.repeat_var).grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=4)
 
         btns = ttk.Frame(dump)
@@ -430,41 +445,69 @@ class DumperApp(tk.Tk):
         else:
             self.log("書き込み失敗。USBを一度抜き差ししてから再試行してください。")
 
-    def _receive(self, port, total_bytes, label=""):
-        """1回分の生ダンプを受信。中止/失敗時は None。"""
+    def _read_bank(self, port, bank, label=""):
+        """Nanoをリセットしてバンク番号を送り、64KB受け取る。失敗したら None。
+
+        ファームは1回の起動につき1バンクだけ読む。起動後に 'R' を送ってくるので、
+        それを待ってからバンク番号を1バイト送る。
+        """
         if serial is None:
             self.log("pyserial がありません。")
             return None
         try:
-            ser = serial.Serial(port, DEFAULT_BAUD, timeout=25)
+            ser = serial.Serial(port, DEFAULT_BAUD, timeout=30)
         except Exception as e:
-            self.log(f"ポートを開けません: {e}")
+            self.log(f"    ポートを開けません: {e}")
             return None
 
         try:
-            time.sleep(2)             # Nano自動リセット後の起動待ち
-            ser.reset_input_buffer()  # 前回の残留バイトを捨てる
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                if self.cancel_flag.is_set():
+                    return None
+                if ser.read(1) == b"R":
+                    break
+            else:
+                self.log("    Nanoからの準備完了(R)が来ませんでした")
+                return None
+
+            ser.write(bytes([bank]))
+            ser.flush()
 
             buf = bytearray()
-            start = time.time()
-            self.after(0, lambda: self.progress.config(maximum=total_bytes, value=0))
-            while len(buf) < total_bytes:
+            self.after(0, lambda: self.progress.config(maximum=BANK_SIZE, value=0))
+            while len(buf) < BANK_SIZE:
                 if self.cancel_flag.is_set():
                     self.log("中止しました。")
                     return None
-                chunk = ser.read(min(4096, total_bytes - len(buf)))
+                chunk = ser.read(min(4096, BANK_SIZE - len(buf)))
                 if not chunk:
-                    self.log(f"タイムアウト: {len(buf)}/{total_bytes} バイト")
+                    self.log(f"    タイムアウト ({len(buf)}/{BANK_SIZE})")
                     return None
                 buf += chunk
                 got = len(buf)
                 self.after(0, lambda v=got: self.progress.config(value=v))
-                pct = got * 100 // total_bytes
-                self.status_var.set(f"{label}受信中 {pct}%")
-            self.log(f"受信完了 {len(buf)} bytes ({time.time() - start:.1f}s)")
+                self.status_var.set(f"{label}{got * 100 // BANK_SIZE}%")
             return bytes(buf)
         finally:
             ser.close()
+
+    def _confirm_bank(self, port, bank, max_attempts=8):
+        """同じバンクを読み直し、2回連続で完全一致した内容を返す。"""
+        prev = None
+        for attempt in range(1, max_attempts + 1):
+            if self.cancel_flag.is_set():
+                return None
+            data = self._read_bank(port, bank, label=f"bank{bank} ({attempt}回目) ")
+            if data is None:
+                continue
+            if prev is not None:
+                diff = sum(1 for a, b in zip(prev, data) if a != b)
+                if diff == 0:
+                    return data
+                self.log(f"    試行{attempt}: 前回と {diff} バイト相違、読み直します")
+            prev = data
+        return None
 
     def start_identify(self):
         port = self.selected_port()
@@ -474,36 +517,36 @@ class DumperApp(tk.Tk):
         self.run_worker(lambda: self._identify(port))
 
     def _identify(self, port):
-        self.log("カート判定のため1バンク分を読み取ります。")
-        self.log("※ Nano-2 のスケッチの NUM_BANKS が 1 になっている必要があります。")
-        raw = self._receive(port, BANK_SIZE, "判定用 ")
+        self.log("カート判定のためバンク0を読み取ります。")
+        raw = self._read_bank(port, 0, "判定用 ")
         if raw is None:
             return
-        mapping, hdr = detect_mapping(raw)
-        if not mapping:
+
+        mapping, hdr, reason = detect_mapping(raw)
+        self.log(f"判定結果: {mapping.upper()}  （根拠: {reason}）")
+        if not hdr:
             self.log("ヘッダを認識できませんでした。カートの接触や配線を確認してください。")
             return
-        self.log(f"判定結果: {mapping.upper()}  タイトル『{hdr['title']}』")
-        self.log(f"  ROMサイズ: {hdr['size_kb']} KB / チェックサム: {hex(hdr['checksum'])}")
+
+        self.log(f"  タイトル『{hdr['title']}』")
+        self.log(f"  map_mode=0x{hdr['map_mode']:02x} / ROMサイズ申告 {hdr['size_kb']} KB "
+                 f"/ チェックサム 0x{hdr['checksum']:04x}")
 
         self.mapping_var.set(mapping)
 
         if self.db_size_bytes:
-            # DBで明示的に選んだサイズがあるなら、そちらを優先する。
-            # ヘッダの自己申告は2の累乗に切り上げられていることがあるため。
             self.log("  データベースで選択済みのサイズを優先します。")
             self.recompute_banks()
         elif hdr["size_kb"]:
-            banks = hdr["size_kb"] * 1024 // (BANK_SIZE if mapping == "hirom" else BANK_SIZE // 2)
+            per_bank = BANK_SIZE if mapping == "hirom" else BANK_SIZE // 2
+            banks = hdr["size_kb"] * 1024 // per_bank
             self.banks_var.set(str(banks))
-            self.log(f"  → バンク数を {banks} に設定しました。"
-                     f"Nano-2 の NUM_BANKS も同じ値にして書き込み直してください。")
+            self.log(f"  → バンク数を {banks} に設定しました。")
 
         if not self.db_size_bytes:
             safe = "".join(c for c in hdr["title"] if c.isalnum() or c in " _-").strip().replace(" ", "")
             if safe:
                 self.out_var.set(os.path.join(PROJECT_ROOT, safe + ".sfc"))
-            # ヘッダのタイトルでDBを自動検索しておく
             self.query_var.set(hdr["title"])
             self.after(0, self.search_db)
 
@@ -514,84 +557,83 @@ class DumperApp(tk.Tk):
             return
         try:
             banks = int(self.banks_var.get())
-            if banks < 1:
+            if banks < 1 or banks > 256:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("入力エラー", "バンク数は1以上の整数で指定してください。")
+            messagebox.showerror("入力エラー", "バンク数は1〜256の整数で指定してください。")
+            return
+        mapping = self.mapping_var.get()
+        if mapping == "auto":
+            messagebox.showerror("マッピング未確定",
+                                 "「カートを判定」を実行するか、LoROM/HiROMを選んでください。")
             return
         out = self.out_var.get()
         if not out:
             messagebox.showerror("出力先未設定", "出力ファイルを指定してください。")
             return
-        self.samples = []
-        self.run_worker(lambda: self._dump(port, banks, out))
+        self.run_worker(lambda: self._dump(port, banks, mapping, out))
 
-    def _dump(self, port, banks, out):
-        total = banks * BANK_SIZE
-        mapping_choice = self.mapping_var.get()
-        repeat = self.repeat_var.get()
-        round_no = 0
+    def _dump(self, port, banks, mapping, out):
+        """バンク単位で読む。各バンクは2回読んで完全一致するまで繰り返す。
 
-        while True:
+        確定したバンクは <出力名>.banks/ にキャッシュするので、中断しても再開できる。
+        """
+        cache = out + ".banks"
+        os.makedirs(cache, exist_ok=True)
+        self.log(f"バンク単位でダンプします（{mapping.upper()} / {banks}バンク）")
+        self.log(f"キャッシュ: {cache}")
+
+        collected = []
+        for b in range(banks):
             if self.cancel_flag.is_set():
-                break
-            round_no += 1
-            self.log(f"--- ダンプ {round_no} 回目 ---")
-            raw = self._receive(port, total, f"{round_no}回目 ")
-            if raw is None:
-                if self.cancel_flag.is_set():
-                    break
-                self.log("失敗したので再試行します。")
+                return
+            path = os.path.join(cache, f"bank_{b:03d}.bin")
+            if os.path.exists(path) and os.path.getsize(path) == BANK_SIZE:
+                with open(path, "rb") as f:
+                    collected.append(f.read())
+                self.log(f"bank {b:3d}/{banks}: キャッシュ済み")
                 continue
 
-            self.samples.append(raw)
+            self.log(f"bank {b:3d}/{banks}: 読み出し中")
+            data = self._confirm_bank(port, b)
+            if data is None:
+                if not self.cancel_flag.is_set():
+                    self.log(f"bank {b}: 一致を得られませんでした。中断します。")
+                    self.after(0, lambda bb=b: messagebox.showerror(
+                        "読み出し失敗", f"bank {bb} で一致した読み出しが得られませんでした。"))
+                return
+            with open(path, "wb") as f:
+                f.write(data)
+            collected.append(data)
 
-            mapping = mapping_choice
-            if mapping == "auto":
-                mapping, hdr = detect_mapping(raw[:BANK_SIZE])
-                if not mapping:
-                    self.log("マッピングを自動判定できません。LoROM/HiROMを手動指定してください。")
+        rom = extract_rom(b"".join(collected), mapping)
+        ok, computed, expected = verify_checksum(rom, mapping)
+        crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
+
+        self.log(f"合計 {len(rom)} bytes")
+        self.log(f"  チェックサム 計算値=0x{computed:04x} 期待値="
+                 f"{('0x%04x' % expected) if expected is not None else 'NA'} → "
+                 f"{'一致' if ok else '不一致'}")
+        self.log(f"  CRC32 = {crc}")
+
+        if self.db_entries:
+            for e in self.db_entries:
+                c = e.get("crc")
+                if isinstance(c, bytes) and binascii.hexlify(c).decode() == crc:
+                    self.log(f"  データベース一致: 『{e['name']}』")
                     break
-                self.log(f"自動判定: {mapping.upper()}")
 
-            roms = [extract_rom(r, mapping) for r in self.samples]
-            self.status_var.set("マージ中...")
+        final = out if ok else out + ".unverified"
+        with open(final, "wb") as f:
+            f.write(rom)
+        self.log(f"保存: {final}")
 
-            # ビット落ち方向の誤りが主なのでORを先に試し、駄目なら多数決も見る。
-            candidates = [("OR", or_merge(roms))]
-            disputed = 0
-            if len(roms) > 1:
-                maj, disputed = majority_merge(roms)
-                candidates.append(("多数決", maj))
-
-            hit = None
-            for label, cand in candidates:
-                ok, computed, expected = verify_checksum(cand, mapping)
-                self.log(f"[{label}] サンプル{len(roms)}個 / 不一致バイト{disputed} / "
-                         f"計算値={hex(computed) if computed is not None else 'NA'} "
-                         f"期待値={hex(expected) if expected is not None else 'NA'} → "
-                         f"{'一致' if ok else '不一致'}")
-                if ok and hit is None:
-                    hit = (label, cand)
-
-            if hit:
-                label, merged = hit
-                with open(out, "wb") as f:
-                    f.write(merged)
-                self.log(f"完了: {label}マージで一致。{out} ({len(merged)} bytes) を保存しました。")
-                self.after(0, lambda: messagebox.showinfo(
-                    "ダンプ成功", f"チェックサム一致（{label}マージ）。\n{out}"))
-                return
-            merged = candidates[0][1]
-
-            if not repeat:
-                path = out + ".unverified"
-                with open(path, "wb") as f:
-                    f.write(merged)
-                self.log(f"チェックサム不一致のまま保存しました: {path}")
-                return
-
-            self.log("チェックサムが合わないので、もう1回読み取ります。")
+        if ok:
+            self.after(0, lambda: messagebox.showinfo(
+                "ダンプ成功", f"チェックサム一致。\nCRC32 = {crc}\n{final}"))
+        else:
+            self.after(0, lambda: messagebox.showwarning(
+                "チェックサム不一致", f"検証を通らなかったため .unverified で保存しました。\n{final}"))
 
 
 if __name__ == "__main__":
