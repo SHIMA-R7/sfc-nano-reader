@@ -53,7 +53,7 @@ def main():
     ap.add_argument("--port", required=True)
     ap.add_argument("--bank", type=int, required=True)
     ap.add_argument("--reads", type=int, default=5)
-    ap.add_argument("--baud", type=int, default=250000)
+    ap.add_argument("--baud", type=int, default=1000000)
     args = ap.parse_args()
 
     reads = []

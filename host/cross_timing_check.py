@@ -54,7 +54,7 @@ def main():
     ap.add_argument("--port", required=True)
     ap.add_argument("--cache", required=True)
     ap.add_argument("--banks", required=True, help="カンマ区切りのバンク番号")
-    ap.add_argument("--baud", type=int, default=250000)
+    ap.add_argument("--baud", type=int, default=1000000)
     args = ap.parse_args()
 
     targets = [int(x) for x in args.banks.split(",")]

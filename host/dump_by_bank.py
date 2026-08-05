@@ -27,7 +27,7 @@ def parse_args():
     p.add_argument("--banks", type=int, required=True)
     p.add_argument("--mapping", choices=["hirom", "lorom"], required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--baud", type=int, default=250000)
+    p.add_argument("--baud", type=int, default=1000000)
     p.add_argument("--max-attempts", type=int, default=8,
                    help="1バンクあたり、一致するまで読み直す最大回数")
     p.add_argument("--cache", default=None, help="確定したバンクの保存先 (既定: <out>.banks)")
@@ -85,11 +85,18 @@ def confirm_bank(port, baud, bank, max_attempts):
 
 
 def extract_rom(raw, mapping):
+    """生の64KB×Nバンクから、ROM本体を取り出す。
+
+    LoROMではROMは各バンクの $8000-$FFFF にしか現れない。カートによっては下位32KBが
+    上位のミラーになる（Super Puyo Puyo はこれ）が、下位が一切駆動されず 0x00 で読める
+    カートもある（Super Mario Collection はこれ）。**上位32KBを採るのが常に正しい。**
+    """
     if mapping == "hirom":
         return raw
     out = bytearray()
+    half = BANK_SIZE // 2
     for i in range(0, len(raw), BANK_SIZE):
-        out += raw[i:i + BANK_SIZE // 2]
+        out += raw[i + half:i + BANK_SIZE]
     return bytes(out)
 
 

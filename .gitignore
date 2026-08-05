@@ -29,3 +29,6 @@ host/mario_progress.txt
 # バンクキャッシュ
 *.banks/
 host/test_banks/
+
+# 動作確認用スクリーンショット(一時)
+mario_screenshot.png

@@ -35,8 +35,9 @@ U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 11, /*reset=*/ U8
 const uint32_t BANK_SIZE = 65536UL;
 
 // 読み出しタイミングの実験用パラメータ
-const uint16_t RD_SETTLE_US = 100;   // /RDアサート後にデータを読むまでの待ち
-const uint16_t ADDR_SETTLE_US = 100; // アドレス更新後の待ち
+const uint16_t RD_SETTLE_US = 5;   // /RDアサート後にデータを読むまでの待ち
+const uint16_t ADDR_SETTLE_US = 5; // アドレス更新後の待ち
+const uint16_t PULSE_US = 3;        // STROBEパルス幅。相手はPCINTなので短くてよい
 
 void setDataPinsInput() {
   for (uint8_t i = 0; i < 6; i++) pinMode(DATA_LOW_PINS[i], INPUT);
@@ -44,33 +45,28 @@ void setDataPinsInput() {
   pinMode(D7_PIN, INPUT);
 }
 
-uint8_t readDataBus() {
-  uint8_t v = 0;
-  for (uint8_t i = 0; i < 6; i++) {
-    if (digitalRead(DATA_LOW_PINS[i])) v |= (1 << i);
-  }
-  if (digitalRead(D6_PIN)) v |= (1 << 6);
-  if (digitalRead(D7_PIN)) v |= (1 << 7);
-  return v;
+// cart D0-D5 -> A0-A5 = PINC bit0-5 / cart D6-D7 -> D8-D9 = PINB bit0-1
+static inline uint8_t readDataBus() {
+  return (uint8_t)((PINC & 0x3F) | ((PINB & 0x03) << 6));
 }
 
 void resetNano1Addr() {
   digitalWrite(ADDR_RESET_PIN, HIGH);
-  delayMicroseconds(50);
+  delayMicroseconds(PULSE_US);
   digitalWrite(ADDR_RESET_PIN, LOW);
   delayMicroseconds(100);
 }
 
 void pulseStrobe() {
   digitalWrite(STROBE_PIN, HIGH);
-  delayMicroseconds(50);
+  delayMicroseconds(PULSE_US);
   digitalWrite(STROBE_PIN, LOW);
   delayMicroseconds(ADDR_SETTLE_US); // Nano-1側の16本分のdigitalWrite完了を待つマージン
 }
 
 void resetNano3Bank() {
   digitalWrite(BANK_RESET_PIN, HIGH);
-  delayMicroseconds(50);
+  delayMicroseconds(PULSE_US);
   digitalWrite(BANK_RESET_PIN, LOW);
   delayMicroseconds(100);
 }
@@ -78,7 +74,7 @@ void resetNano3Bank() {
 // Nano-1のpulseStrobe()と同じ発想: このパルス1回でNano-3のバンクが+1される
 void pulseBankStrobe() {
   digitalWrite(BANK_STROBE_PIN, HIGH);
-  delayMicroseconds(50);
+  delayMicroseconds(PULSE_US);
   digitalWrite(BANK_STROBE_PIN, LOW);
   delayMicroseconds(100);
 }
@@ -142,7 +138,7 @@ void setup() {
   oled.drawString(0, 0, "SFC DUMPER");
   oled.drawString(0, 2, "waiting PC...");
 
-  Serial.begin(250000);
+  Serial.begin(1000000); // 16MHzなら誤差0%
   delay(50);
 
   // PC側から「読みたいバンク番号」を1バイト受け取る。
