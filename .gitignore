@@ -22,3 +22,6 @@ build/
 
 # docs/ のスクリーンショットはREADMEで使うので除外しない
 !docs/*.png
+
+# 作業ログ（一時ファイル）
+host/mario_progress.txt

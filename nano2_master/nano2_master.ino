@@ -143,6 +143,8 @@ void setup() {
   char line[17];
   for (uint32_t bank = 0; bank < NUM_BANKS; bank++) {
     if (bank > 0) pulseBankStrobe(); // bankは常に+1ずつ進むのでパルス1回で足りる
+    // 検証済み: OLEDの更新は読み取り誤りの原因ではない（無効にしても誤り率は変わらなかった）。
+    // 逆に更新後にdelayを入れると悪化したので、素直にその場で描画する。
     snprintf(line, sizeof(line), "Bank %2lu/%2lu", (unsigned long)(bank + 1), (unsigned long)NUM_BANKS);
     oled.drawString(0, 2, line);
     for (uint32_t a = 0; a < BANK_SIZE; a++) {
