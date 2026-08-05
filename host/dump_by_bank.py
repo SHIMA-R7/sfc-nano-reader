@@ -2,11 +2,11 @@
 バンク単位でダンプする。1バンクごとにNanoをリセットして読み直す。
 
 長時間連続で読み続けると読み取りが化けるが、1バンク(64KB)だけを起動直後に読む分には
-再現性が完全（同じバンクを2回読んで差分0）。それを利用して、
+再現性が高い。それを利用して、バンクごとに「2回読んで完全一致するまで繰り返す」形で
+確実なデータだけを積み上げる。
 
-    バンクごとに「2回読んで完全一致するまで繰り返す」
-
-という形で確実なデータだけを積み上げる。
+必要なタイミングマージンはROMチップの個体差でかなり違う（bankio.py参照）ため、
+最速の設定から始めて、駄目なら段階的に遅く安全な設定へ上げていく。
 
     python dump_by_bank.py --port COM12 --banks 32 --mapping hirom --out MyGame.sfc
 """
@@ -16,9 +16,7 @@ import os
 import sys
 import time
 
-import serial
-
-BANK_SIZE = 65536
+from bankio import BANK_SIZE, AdaptiveTiming, read_bank_confirmed
 
 
 def parse_args():
@@ -27,61 +25,8 @@ def parse_args():
     p.add_argument("--banks", type=int, required=True)
     p.add_argument("--mapping", choices=["hirom", "lorom"], required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--baud", type=int, default=1000000)
-    p.add_argument("--max-attempts", type=int, default=8,
-                   help="1バンクあたり、一致するまで読み直す最大回数")
     p.add_argument("--cache", default=None, help="確定したバンクの保存先 (既定: <out>.banks)")
     return p.parse_args()
-
-
-def read_bank(port, baud, bank):
-    """Nanoをリセットしてバンク番号を送り、64KB受け取る。失敗したら None。"""
-    try:
-        ser = serial.Serial(port, baud, timeout=30)
-    except Exception as e:
-        print(f"    ポートを開けません: {e}", flush=True)
-        return None
-    try:
-        # Nanoが 'R' を送ってくるまで待つ（起動＋スプラッシュ表示ぶん）
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            b = ser.read(1)
-            if b == b"R":
-                break
-        else:
-            print("    Nanoからの準備完了(R)が来ませんでした", flush=True)
-            return None
-
-        ser.write(bytes([bank]))   # 読みたいバンクを指示
-        ser.flush()
-
-        buf = bytearray()
-        while len(buf) < BANK_SIZE:
-            chunk = ser.read(min(4096, BANK_SIZE - len(buf)))
-            if not chunk:
-                print(f"    タイムアウト ({len(buf)}/{BANK_SIZE})", flush=True)
-                return None
-            buf += chunk
-        return bytes(buf)
-    finally:
-        ser.close()
-
-
-def confirm_bank(port, baud, bank, max_attempts):
-    """同じバンクを読み直し、2回連続で完全一致した内容を返す。"""
-    prev = None
-    for attempt in range(1, max_attempts + 1):
-        data = read_bank(port, baud, bank)
-        if data is None:
-            continue
-        if prev is not None:
-            diff = sum(1 for a, b in zip(prev, data) if a != b)
-            if diff == 0:
-                print(f"    確定 (試行{attempt})", flush=True)
-                return data
-            print(f"    試行{attempt}: 前回と {diff} バイト相違、読み直します", flush=True)
-        prev = data
-    return None
 
 
 def extract_rom(raw, mapping):
@@ -117,6 +62,10 @@ def main():
     cache = args.cache or (args.out + ".banks")
     os.makedirs(cache, exist_ok=True)
 
+    dump_start = time.time()
+    read_count = 0  # 新規に読んだバンク数（キャッシュ済みは除く）
+    adaptive = AdaptiveTiming()
+
     banks = []
     for b in range(args.banks):
         path = os.path.join(cache, f"bank_{b:03d}.bin")
@@ -127,13 +76,21 @@ def main():
             continue
 
         print(f"bank {b:3d}: 読み出し中", flush=True)
-        data = confirm_bank(args.port, args.baud, b, args.max_attempts)
+        bank_start = time.time()
+        data, tier_idx, tier = read_bank_confirmed(
+            args.port, b, total_banks=args.banks, start_idx=adaptive.next_start_idx(),
+            log=lambda m: print(m, flush=True))
         if data is None:
             print(f"bank {b:3d}: 一致を得られませんでした。中断します。", flush=True)
             return 1
+        adaptive.report(tier_idx, log=lambda m: print(m, flush=True))
+        print(f"bank {b:3d}: 完了 [{tier}] ({time.time() - bank_start:.1f}秒)", flush=True)
         with open(path, "wb") as f:
             f.write(data)
         banks.append(data)
+        read_count += 1
+
+    dump_elapsed = time.time() - dump_start
 
     raw = b"".join(banks)
     rom = extract_rom(raw, args.mapping)
@@ -141,6 +98,13 @@ def main():
     print(f"\n合計 {len(rom)} bytes / 計算値={hex(computed) if computed is not None else 'NA'} "
           f"期待値={hex(expected) if expected is not None else 'NA'} -> "
           f"{'一致' if ok else '不一致'}", flush=True)
+
+    if read_count:
+        speed = (read_count * BANK_SIZE) / dump_elapsed / 1024
+        print(f"所要時間 = {dump_elapsed:.1f}秒 (新規読み出し{read_count}バンク, "
+              f"平均{speed:.1f} KB/s)", flush=True)
+    else:
+        print(f"所要時間 = {dump_elapsed:.1f}秒（全バンクがキャッシュ済みでした）", flush=True)
 
     out = args.out if ok else args.out + ".unverified"
     with open(out, "wb") as f:

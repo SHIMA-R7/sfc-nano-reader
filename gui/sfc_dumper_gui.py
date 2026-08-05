@@ -27,7 +27,14 @@ except ImportError:
 
 import rdb
 
-BANK_SIZE = 65536
+# bankio.py は host/ にあるものを単一のソースとして使う（gui/には複製しない）。
+# frozen(exe化)時は同梱リソースとして同じ場所に配置する（後述のビルド手順を参照）。
+_HOST_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "host")
+if _HOST_DIR not in sys.path:
+    sys.path.insert(0, _HOST_DIR)
+from bankio import (BANK_SIZE, TIMING_TIERS, AdaptiveTiming,  # noqa: E402
+                    read_bank_confirmed, _read_bank_once)
+
 DEFAULT_BAUD = 1000000
 
 # PyInstallerでexe化すると __file__ は一時展開先を指すので、
@@ -446,68 +453,34 @@ class DumperApp(tk.Tk):
             self.log("書き込み失敗。USBを一度抜き差ししてから再試行してください。")
 
     def _read_bank(self, port, bank, label=""):
-        """Nanoをリセットしてバンク番号を送り、64KB受け取る。失敗したら None。
-
-        ファームは1回の起動につき1バンクだけ読む。起動後に 'R' を送ってくるので、
-        それを待ってからバンク番号を1バイト送る。
-        """
+        """1回だけ読む（最速の設定）。カート判定などマージン不問の用途向け。"""
         if serial is None:
             self.log("pyserial がありません。")
             return None
-        try:
-            ser = serial.Serial(port, DEFAULT_BAUD, timeout=30)
-        except Exception as e:
-            self.log(f"    ポートを開けません: {e}")
-            return None
+        self.after(0, lambda: self.progress.config(maximum=BANK_SIZE, value=0))
 
-        try:
-            deadline = time.time() + 20
-            while time.time() < deadline:
-                if self.cancel_flag.is_set():
-                    return None
-                if ser.read(1) == b"R":
-                    break
-            else:
-                self.log("    Nanoからの準備完了(R)が来ませんでした")
-                return None
+        def progress(got, total):
+            self.after(0, lambda: self.progress.config(value=got))
+            self.status_var.set(f"{label}{got * 100 // total}%")
 
-            ser.write(bytes([bank]))
-            ser.flush()
+        data = _read_bank_once(port, bank, TIMING_TIERS[0],
+                               cancel_flag=self.cancel_flag, log=self.log)
+        if data:
+            progress(len(data), BANK_SIZE)
+        return data
 
-            buf = bytearray()
-            self.after(0, lambda: self.progress.config(maximum=BANK_SIZE, value=0))
-            while len(buf) < BANK_SIZE:
-                if self.cancel_flag.is_set():
-                    self.log("中止しました。")
-                    return None
-                chunk = ser.read(min(4096, BANK_SIZE - len(buf)))
-                if not chunk:
-                    self.log(f"    タイムアウト ({len(buf)}/{BANK_SIZE})")
-                    return None
-                buf += chunk
-                got = len(buf)
-                self.after(0, lambda v=got: self.progress.config(value=v))
-                self.status_var.set(f"{label}{got * 100 // BANK_SIZE}%")
-            return bytes(buf)
-        finally:
-            ser.close()
+    def _confirm_bank(self, port, bank, total_banks=0, start_idx=0):
+        """バンクを確定させる。マージンが足りなければ自動でタイミングを上げる。
 
-    def _confirm_bank(self, port, bank, max_attempts=8):
-        """同じバンクを読み直し、2回連続で完全一致した内容を返す。"""
-        prev = None
-        for attempt in range(1, max_attempts + 1):
-            if self.cancel_flag.is_set():
-                return None
-            data = self._read_bank(port, bank, label=f"bank{bank} ({attempt}回目) ")
-            if data is None:
-                continue
-            if prev is not None:
-                diff = sum(1 for a, b in zip(prev, data) if a != b)
-                if diff == 0:
-                    return data
-                self.log(f"    試行{attempt}: 前回と {diff} バイト相違、読み直します")
-            prev = data
-        return None
+        戻り値は (data, tier_idx, tier_label) か (None, None, None)。
+        """
+        def progress(got, total):
+            self.after(0, lambda: self.progress.config(maximum=total, value=got))
+            self.status_var.set(f"bank{bank} {got * 100 // total}%")
+
+        return read_bank_confirmed(port, bank, total_banks=total_banks, start_idx=start_idx,
+                                   cancel_flag=self.cancel_flag,
+                                   log=self.log, progress=progress)
 
     def start_identify(self):
         port = self.selected_port()
@@ -583,6 +556,10 @@ class DumperApp(tk.Tk):
         self.log(f"バンク単位でダンプします（{mapping.upper()} / {banks}バンク）")
         self.log(f"キャッシュ: {cache}")
 
+        dump_start = time.time()
+        read_count = 0  # 新規に読んだバンク数（キャッシュ済みは除く）
+        adaptive = AdaptiveTiming()
+
         collected = []
         for b in range(banks):
             if self.cancel_flag.is_set():
@@ -595,16 +572,24 @@ class DumperApp(tk.Tk):
                 continue
 
             self.log(f"bank {b:3d}/{banks}: 読み出し中")
-            data = self._confirm_bank(port, b)
+            bank_start = time.time()
+            data, tier_idx, tier = self._confirm_bank(
+                port, b, total_banks=banks, start_idx=adaptive.next_start_idx())
             if data is None:
                 if not self.cancel_flag.is_set():
                     self.log(f"bank {b}: 一致を得られませんでした。中断します。")
                     self.after(0, lambda bb=b: messagebox.showerror(
                         "読み出し失敗", f"bank {bb} で一致した読み出しが得られませんでした。"))
                 return
+            adaptive.report(tier_idx, log=self.log)
+            bank_elapsed = time.time() - bank_start
+            self.log(f"bank {b:3d}/{banks}: 完了 [{tier}] ({bank_elapsed:.1f}秒)")
             with open(path, "wb") as f:
                 f.write(data)
             collected.append(data)
+            read_count += 1
+
+        dump_elapsed = time.time() - dump_start
 
         rom = extract_rom(b"".join(collected), mapping)
         ok, computed, expected = verify_checksum(rom, mapping)
@@ -615,6 +600,12 @@ class DumperApp(tk.Tk):
                  f"{('0x%04x' % expected) if expected is not None else 'NA'} → "
                  f"{'一致' if ok else '不一致'}")
         self.log(f"  CRC32 = {crc}")
+        if read_count:
+            speed = (read_count * BANK_SIZE) / dump_elapsed / 1024
+            self.log(f"  所要時間 = {dump_elapsed:.1f}秒 "
+                     f"(新規読み出し{read_count}バンク, 平均{speed:.1f} KB/s)")
+        else:
+            self.log(f"  所要時間 = {dump_elapsed:.1f}秒（全バンクがキャッシュ済みでした）")
 
         if self.db_entries:
             for e in self.db_entries:

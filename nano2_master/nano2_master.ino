@@ -41,10 +41,16 @@ const uint32_t BANK_SIZE = 65536UL;
 __attribute__((section(".noinit"))) uint32_t bootMagic;
 const uint32_t BOOT_MAGIC = 0x5FC0DEADUL;
 
-// 読み出しタイミングの実験用パラメータ
-const uint16_t RD_SETTLE_US = 5;   // /RDアサート後にデータを読むまでの待ち
-const uint16_t ADDR_SETTLE_US = 5; // アドレス更新後の待ち
-const uint16_t PULSE_US = 3;        // STROBEパルス幅。相手はPCINTなので短くてよい
+// 読み出しタイミングはPC側から毎回指定される（コンパイル時固定ではない）。
+// 理由: 必要なマージンはカートのROMチップ個体差でかなり違う。同じ5usの設定で
+// Super Mario Collection と 夜光虫 は一発で通ったが、Street Fighter II は
+// 2回連続一致に何度失敗しても揃わず、100usまで上げてようやく安定した。
+// 全カート一律で遅くするのは、マージンが要らないカートの速度を無駄に捨てることになる。
+// そこでPC側が「まず5usで試し、駄目なら段階的に上げる」エスカレーションを行い、
+// 都度この変数へ値をセットしてから読む。
+uint16_t rdSettleUs = 5;
+uint16_t addrSettleUs = 5;
+uint16_t pulseUs = 3;
 
 void setDataPinsInput() {
   for (uint8_t i = 0; i < 6; i++) pinMode(DATA_LOW_PINS[i], INPUT);
@@ -59,21 +65,21 @@ static inline uint8_t readDataBus() {
 
 void resetNano1Addr() {
   digitalWrite(ADDR_RESET_PIN, HIGH);
-  delayMicroseconds(PULSE_US);
+  delayMicroseconds(pulseUs);
   digitalWrite(ADDR_RESET_PIN, LOW);
   delayMicroseconds(100);
 }
 
 void pulseStrobe() {
   digitalWrite(STROBE_PIN, HIGH);
-  delayMicroseconds(PULSE_US);
+  delayMicroseconds(pulseUs);
   digitalWrite(STROBE_PIN, LOW);
-  delayMicroseconds(ADDR_SETTLE_US); // Nano-1側の16本分のdigitalWrite完了を待つマージン
+  delayMicroseconds(addrSettleUs); // Nano-1側の16本分のdigitalWrite完了を待つマージン
 }
 
 void resetNano3Bank() {
   digitalWrite(BANK_RESET_PIN, HIGH);
-  delayMicroseconds(PULSE_US);
+  delayMicroseconds(pulseUs);
   digitalWrite(BANK_RESET_PIN, LOW);
   delayMicroseconds(100);
 }
@@ -81,7 +87,7 @@ void resetNano3Bank() {
 // Nano-1のpulseStrobe()と同じ発想: このパルス1回でNano-3のバンクが+1される
 void pulseBankStrobe() {
   digitalWrite(BANK_STROBE_PIN, HIGH);
-  delayMicroseconds(PULSE_US);
+  delayMicroseconds(pulseUs);
   digitalWrite(BANK_STROBE_PIN, LOW);
   delayMicroseconds(100);
 }
@@ -123,7 +129,7 @@ void splashScreen() {
 uint8_t readByte() {
   digitalWrite(ROMSEL_PIN, LOW);
   digitalWrite(RD_PIN, LOW);
-  delayMicroseconds(RD_SETTLE_US); // 長い配線の寄生容量を考慮して大きめに確保
+  delayMicroseconds(rdSettleUs); // 長い配線の寄生容量を考慮して大きめに確保
   uint8_t v = readDataBus();
   digitalWrite(RD_PIN, HIGH);
   digitalWrite(ROMSEL_PIN, HIGH);
@@ -154,26 +160,51 @@ void setup() {
   Serial.begin(1000000); // 16MHzなら誤差0%
   delay(50);
 
-  // PC側から「読みたいバンク番号」を1バイト受け取る。
+  // PC側から「バンク番号(1B) + 全バンク数(1B) + RD待ち(2B,LE) + ADDR待ち(2B,LE)
+  // + パルス幅(2B,LE)」の計8バイトを受け取る。タイミングはコンパイル時固定ではなく、
+  // PC側がカートごとに「まず速い設定で試し、駄目なら段階的に上げる」ために毎回送ってくる。
+  // 全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出し自体には無関係）。
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
-  while (Serial.available() == 0) { /* 待機 */ }
-  uint8_t target = (uint8_t)Serial.read();
+  uint8_t hdr[8];
+  for (uint8_t i = 0; i < 8; i++) {
+    while (Serial.available() == 0) { /* 待機 */ }
+    hdr[i] = (uint8_t)Serial.read();
+  }
+  uint8_t target = hdr[0];
+  uint8_t totalBanks = hdr[1];
+  rdSettleUs   = (uint16_t)(hdr[2] | (hdr[3] << 8));
+  addrSettleUs = (uint16_t)(hdr[4] | (hdr[5] << 8));
+  pulseUs      = (uint16_t)(hdr[6] | (hdr[7] << 8));
 
   char line[17];
-  snprintf(line, sizeof(line), "Bank %3u      ", (unsigned)target);
+  if (totalBanks > 0) {
+    snprintf(line, sizeof(line), "Bank %3u/%3u  ", (unsigned)target + 1, (unsigned)totalBanks);
+  } else {
+    snprintf(line, sizeof(line), "Bank %3u      ", (unsigned)target);
+  }
   oled.drawString(0, 2, line);
 
   resetNano1Addr();
   resetNano3Bank();
   for (uint16_t b = 0; b < target; b++) pulseBankStrobe(); // 目的のバンクまで進める
 
+  char prog[17];
   for (uint32_t a = 0; a < BANK_SIZE; a++) {
     uint8_t v = readByte();
     Serial.write(v);
     pulseStrobe(); // 読んだ直後に次のアドレスへ進める
+
+    // OLED更新は1回数msかかるので毎バイトはやらない（47us/byteの律速を壊す）。
+    // 8192バイトごと(1バンクあたり8回)なら誤差程度。
+    if ((a & 0x1FFF) == 0) {
+      snprintf(prog, sizeof(prog), "%5lu/%5lu", (unsigned long)(a + 1), (unsigned long)BANK_SIZE);
+      oled.drawString(0, 4, prog);
+    }
   }
+  snprintf(prog, sizeof(prog), "%5lu/%5lu", (unsigned long)BANK_SIZE, (unsigned long)BANK_SIZE);
+  oled.drawString(0, 4, prog);
 
   oled.drawString(0, 2, "DONE          ");
 
