@@ -26,10 +26,28 @@ const uint8_t D6_PIN = 8;
 const uint8_t D7_PIN = 9;
 const uint8_t DATA_LOW_PINS[6] = {A0, A1, A2, A3, A4, A5}; // cart D0-D5
 const uint8_t ADDR_RESET_PIN = 10; // Nano-1のアドレスカウンタを0に戻す
-// D13は将来のSPI SD用に予約
+
+// カートへ供給するクロック(PHI2 / カート57番)。
+// マスクROMは非同期なので不要だが、コプロ搭載カートは中のチップが同期回路なので、
+// クロックが来ないとリセットすら伝わらず、ROMを正しく通してくれない。
+// Super FXのスターフォックスで、タイミングを変えても電源を強化しても /RESET を叩いても
+// 約920バイト/バンクが0xFFのまま残ったのが、この仮説に至った経緯。
+//
+// D11でなければならない理由: 1MHzはソフトでは出せずタイマーのハードウェア出力が要る。
+// Nano-2で解放できるタイマー出力ピンはOC2A(=D11)だけ。そのためOLEDのデータ線をD13へ
+// 追い出してD11を空けた。実機の21.477MHzである必要はなく、OSCRもカートを1MHzで走らせている。
+const uint8_t CART_CLK_PIN = 11;
 
 #include <U8x8lib.h>
-U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 11, /*reset=*/ U8X8_PIN_NONE);
+U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 13, /*reset=*/ U8X8_PIN_NONE);
+
+// 16MHz / (2 * (1 + OCR2A)) = 出力周波数。7で1MHz、1で4MHz、0で8MHz。
+void startCartClock(uint8_t ocr) {
+  pinMode(CART_CLK_PIN, OUTPUT);
+  TCCR2A = _BV(COM2A0) | _BV(WGM21); // CTCモード、比較一致でOC2Aをトグル
+  TCCR2B = _BV(CS20);                // 分周なし
+  OCR2A = ocr;
+}
 
 // バンク単位モード:
 //   長時間連続で読み続けると読み取りが化ける（同じバンクでも全体ダンプ中は毎回700バイト前後
@@ -184,6 +202,10 @@ void setup() {
   // 送ってくる。全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出しには無関係）。
   // フラグのbit0が立っていればSRAM(セーブデータ)モード = /ROMSEL をアサートしない。
   // bit1が立っていれば読み出し中ずっとカートの /RESET をLowに保持する(コプロ実験用)。
+  // bit2が立っていればカートへクロックを供給する。既定は供給しない。
+  //   Super FXでは供給すると逆効果だった。クロックが無い間GSUは眠っていてROMが見えるが、
+  //   与えた途端に起きてバスを完全に奪い、読めるのはオープンバスだけになる。
+  //   一方SA-1やCIC認証にはクロックが要るので、切り替えられるようにしてある。
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
@@ -199,6 +221,7 @@ void setup() {
   pulseUs      = (uint16_t)(hdr[6] | (hdr[7] << 8));
   sramMode     = (hdr[8] & 0x01) != 0;
   const bool holdReset = (hdr[8] & 0x02) != 0;
+  if (hdr[8] & 0x04) startCartClock(7); // 1MHz
 
   // コプロを止めたままROMが覗けるか試すためのモード。バスを明け渡すかはチップ次第で、
   // 通るかどうかは実測するしかない。通常のROMカートでは /RESET は無関係。

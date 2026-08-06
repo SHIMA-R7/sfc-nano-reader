@@ -29,6 +29,7 @@ Super FXでは待ち時間を伸ばすと**かえって悪化する**（5us:89�
 
 import argparse
 import collections
+import glob
 import os
 import sys
 import time
@@ -42,18 +43,33 @@ def parse_args():
     p.add_argument("--port", required=True)
     p.add_argument("--banks", type=int, required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--samples", type=int, default=5, help="1バンクあたりの読み回数 (既定5)")
+    p.add_argument("--samples", type=int, default=5,
+                   help="1バンクあたり最終的に何本のサンプルを揃えるか (既定5)。"
+                        "生サンプルはキャッシュに残るので、あとから大きい値で再実行すれば"
+                        "不足分だけ読み足す。5で走らせた後に10を指定すれば5本追加になる")
     p.add_argument("--start-bank", default="0")
     p.add_argument("--mapping", choices=["lorom", "hirom", "linear"], default="linear",
                    help="lorom は各バンクの上位32KBだけ採る。hirom/linear は64KBフル")
-    p.add_argument("--cache", default=None, help="確定バンクの保存先 (既定: <out>.votes)")
+    p.add_argument("--mirror-halves", action="store_true",
+                   help="下位32KBが上位のミラーになっているカートで、1回の読み出しから"
+                        "サンプルを2つ取り出す。実質サンプル数が倍になる")
+    p.add_argument("--prefer-nonff", action="store_true",
+                   help="0xFFを「読めなかった印」とみなし、非0xFFの最頻値を優先する。"
+                        "バスを奪い合う相手(Super FXのGSU等)がいる場合に有効。"
+                        "本物の0xFFは全サンプルで0xFFになるので誤らない")
+    p.add_argument("--cache", default=None, help="生サンプルの保存先 (既定: <out>.votes)")
     a = p.parse_args()
     a.start_bank = int(str(a.start_bank), 0)
     return a
 
 
-def vote(samples):
+def vote(samples, prefer_nonff=False):
     """バイトごとの多数決。外れ値のサンプルを捨ててから集計する。
+
+    prefer_nonff=True では 0xFF を「読めなかった印」として扱い、非0xFFの最頻値を優先する。
+    Super FXのように相手がバスを握る場合、奪われた読みは0xFFになるため、たとえ0xFFが
+    多数派でも1本でも実データが取れていればそちらが正しい。本物の0xFFなら全サンプルが
+    0xFFになるので、この優先規則で壊れることはない。
 
     戻り値は (確定データ, 採用サンプル数, 過半数に届かなかったバイト数)。
     """
@@ -64,7 +80,16 @@ def vote(samples):
         out = bytearray(len(pool[0]))
         weak = 0
         for i in range(len(out)):
-            c = collections.Counter(s[i] for s in pool)
+            vals = [s[i] for s in pool]
+            c = collections.Counter(vals)
+            if prefer_nonff:
+                nz = collections.Counter(v for v in vals if v != 0xFF)
+                if nz:
+                    v, n = nz.most_common(1)[0]
+                    out[i] = v
+                    if n * 2 <= sum(nz.values()):
+                        weak += 1
+                    continue
             v, n = c.most_common(1)[0]
             out[i] = v
             if n * 2 <= len(pool):
@@ -115,34 +140,46 @@ def main():
     banks = []
     for i in range(args.banks):
         b = args.start_bank + i
-        path = os.path.join(cache, f"bank_{b:03d}.bin")
-        if os.path.exists(path) and os.path.getsize(path) == BANK_SIZE:
-            with open(path, "rb") as f:
-                banks.append(f.read())
-            print(f"bank ${b:02X}: キャッシュ済み", flush=True)
-            continue
 
+        # 生サンプルを1本ずつ別ファイルで残す。集計結果だけを保存すると、あとから
+        # 読み足して精度を上げることができず、40分かけた読み出しを毎回捨てることになる。
+        existing = sorted(glob.glob(os.path.join(cache, f"bank_{b:03d}_s*.bin")))
         samples = []
-        for n in range(args.samples):
-            data = _read_bank_once(args.port, b, TIMING_TIERS[0],
-                                   log=lambda m: print(m, flush=True))
-            if data is not None:
+        for f in existing:
+            if os.path.getsize(f) == BANK_SIZE:
+                with open(f, "rb") as fh:
+                    samples.append(fh.read())
+
+        need = args.samples - len(samples)
+        if need > 0:
+            if samples:
+                print(f"bank ${b:02X}: 既存{len(samples)}本 + {need}本を追加読み", flush=True)
+            for n in range(need):
+                data = _read_bank_once(args.port, b, TIMING_TIERS[0],
+                                       log=lambda m: print(m, flush=True))
+                if data is None:
+                    continue
+                idx = len(samples)
+                with open(os.path.join(cache, f"bank_{b:03d}_s{idx:02d}.bin"), "wb") as fh:
+                    fh.write(data)
                 samples.append(data)
         if not samples:
             print(f"bank ${b:02X}: 1回も読めませんでした。中断します。", flush=True)
             return 1
 
-        merged, used, weak = vote(samples)
+        pool = samples
+        if args.mirror_halves:
+            half = BANK_SIZE // 2
+            pool = [h for s in samples for h in (s[:half], s[half:])]
+        merged, used, weak = vote(pool, prefer_nonff=args.prefer_nonff)
         uniq = len(set(merged))
-        print(f"bank ${b:02X}: {len(samples)}回読み → {used}本採用 / "
+        print(f"bank ${b:02X}: サンプル{len(samples)}本({len(pool)}系列) → {used}本採用 / "
               f"過半数未達 {weak} バイト / 異なる値 {uniq}種", flush=True)
         if uniq <= 1:
             print(f"  ※ 全バイトが同一値です。この窓には何も応答していません。", flush=True)
-        with open(path, "wb") as f:
-            f.write(merged)
         banks.append(merged)
 
-    rom = extract(b"".join(banks), args.mapping)
+    rom = b"".join(banks) if args.mirror_halves else extract(b"".join(banks), args.mapping)
     off, expected, computed = verify(rom)
     crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
 

@@ -46,7 +46,7 @@ def _is_degenerate(data):
 
 
 def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
-                    sram=False, hold_reset=False):
+                    sram=False, hold_reset=False, cart_clock=False):
     """指定タイミングで1回読む。失敗したら None。
 
     total_banks は読み出しには使わず、OLEDに「現在/全体」を表示させるためだけに送る。
@@ -55,6 +55,8 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
     sram=True でセーブ用SRAMモード。ファーム側が /ROMSEL をアサートしなくなる。
     hold_reset=True で読み出し中ずっとカートの /RESET をLowに保持する。コプロ(Super FX /
     SA-1)を止めたままROMが覗けるかを試すための実験用。
+    cart_clock=True でカートへ1MHzを供給する。Super FXでは逆効果(GSUが起きてバスを奪う)
+    だったが、SA-1やCIC認証には必要になるため切り替え可能にしてある。
     """
     rd_us, addr_us, pulse_us, _ = tier
     try:
@@ -81,7 +83,8 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
             rd_us & 0xFF, (rd_us >> 8) & 0xFF,
             addr_us & 0xFF, (addr_us >> 8) & 0xFF,
             pulse_us & 0xFF, (pulse_us >> 8) & 0xFF,
-            (0x01 if sram else 0x00) | (0x02 if hold_reset else 0x00),
+            ((0x01 if sram else 0x00) | (0x02 if hold_reset else 0x00)
+             | (0x04 if cart_clock else 0x00)),
         ])
         ser.write(header)
         ser.flush()
