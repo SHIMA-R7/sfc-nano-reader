@@ -45,11 +45,14 @@ def _is_degenerate(data):
     return all(b == first for b in data)
 
 
-def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None):
+def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
+                    sram=False):
     """指定タイミングで1回読む。失敗したら None。
 
     total_banks は読み出しには使わず、OLEDに「現在/全体」を表示させるためだけに送る。
     0を渡すと従来通りバンク番号だけの表示になる（カート判定など全体数が未確定の場面用）。
+
+    sram=True でセーブ用SRAMモード。ファーム側が /ROMSEL をアサートしなくなる。
     """
     rd_us, addr_us, pulse_us, _ = tier
     try:
@@ -76,6 +79,7 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None)
             rd_us & 0xFF, (rd_us >> 8) & 0xFF,
             addr_us & 0xFF, (addr_us >> 8) & 0xFF,
             pulse_us & 0xFF, (pulse_us >> 8) & 0xFF,
+            0x01 if sram else 0x00,
         ])
         ser.write(header)
         ser.flush()

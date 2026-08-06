@@ -126,13 +126,22 @@ void splashScreen() {
   oled.clear();
 }
 
+// セーブ用SRAMを読むときは /ROMSEL をアサートしてはいけない。
+// ROMは /ROMSEL で選択されるが、カート上のSRAMはバンク($70〜 / $20〜)とアドレスを
+// カート内部のデコード回路が見て自前で選択する。ROM読み出しと同じように /ROMSEL を
+// Lowにすると、SRAMではなくROM側が応答してしまう。
+//
+// なお /WR はカート側で +5V に直結してあるので、ここで何をしようとSRAMへの書き込みは
+// 物理的に起こらない。救出対象のセーブデータを壊す事故は原理的に発生しない。
+bool sramMode = false;
+
 uint8_t readByte() {
-  digitalWrite(ROMSEL_PIN, LOW);
+  if (!sramMode) digitalWrite(ROMSEL_PIN, LOW);
   digitalWrite(RD_PIN, LOW);
   delayMicroseconds(rdSettleUs); // 長い配線の寄生容量を考慮して大きめに確保
   uint8_t v = readDataBus();
   digitalWrite(RD_PIN, HIGH);
-  digitalWrite(ROMSEL_PIN, HIGH);
+  if (!sramMode) digitalWrite(ROMSEL_PIN, HIGH);
   return v;
 }
 
@@ -161,14 +170,15 @@ void setup() {
   delay(50);
 
   // PC側から「バンク番号(1B) + 全バンク数(1B) + RD待ち(2B,LE) + ADDR待ち(2B,LE)
-  // + パルス幅(2B,LE)」の計8バイトを受け取る。タイミングはコンパイル時固定ではなく、
-  // PC側がカートごとに「まず速い設定で試し、駄目なら段階的に上げる」ために毎回送ってくる。
-  // 全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出し自体には無関係）。
+  // + パルス幅(2B,LE) + フラグ(1B)」の計9バイトを受け取る。タイミングはコンパイル時固定
+  // ではなく、PC側がカートごとに「まず速い設定で試し、駄目なら段階的に上げる」ために毎回
+  // 送ってくる。全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出しには無関係）。
+  // フラグのbit0が立っていればSRAM(セーブデータ)モード = /ROMSEL をアサートしない。
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
-  uint8_t hdr[8];
-  for (uint8_t i = 0; i < 8; i++) {
+  uint8_t hdr[9];
+  for (uint8_t i = 0; i < 9; i++) {
     while (Serial.available() == 0) { /* 待機 */ }
     hdr[i] = (uint8_t)Serial.read();
   }
@@ -177,9 +187,12 @@ void setup() {
   rdSettleUs   = (uint16_t)(hdr[2] | (hdr[3] << 8));
   addrSettleUs = (uint16_t)(hdr[4] | (hdr[5] << 8));
   pulseUs      = (uint16_t)(hdr[6] | (hdr[7] << 8));
+  sramMode     = (hdr[8] & 0x01) != 0;
 
   char line[17];
-  if (totalBanks > 0) {
+  if (sramMode) {
+    snprintf(line, sizeof(line), "SRAM bank $%02X ", (unsigned)target);
+  } else if (totalBanks > 0) {
     snprintf(line, sizeof(line), "Bank %3u/%3u  ", (unsigned)target + 1, (unsigned)totalBanks);
   } else {
     snprintf(line, sizeof(line), "Bank %3u      ", (unsigned)target);
