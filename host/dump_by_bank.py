@@ -26,7 +26,14 @@ def parse_args():
     p.add_argument("--mapping", choices=["hirom", "lorom"], required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--cache", default=None, help="確定したバンクの保存先 (既定: <out>.banks)")
-    return p.parse_args()
+    p.add_argument("--start-bank", default="0",
+                   help="読み始めるバンク番号 (既定 0)。DSP-1搭載のHiROMカート"
+                        "(スーパーマリオカート等)は 0xC0 を指定する。"
+                        "$00-$3F の $6000-$7FFF はDSP-1に乗っ取られていてROMが読めないが、"
+                        "$C0 以降のミラーにはDSP-1が居ないため")
+    a = p.parse_args()
+    a.start_bank = int(str(a.start_bank), 0)
+    return a
 
 
 def extract_rom(raw, mapping):
@@ -67,7 +74,8 @@ def main():
     adaptive = AdaptiveTiming()
 
     banks = []
-    for b in range(args.banks):
+    for i in range(args.banks):
+        b = args.start_bank + i
         path = os.path.join(cache, f"bank_{b:03d}.bin")
         if os.path.exists(path) and os.path.getsize(path) == BANK_SIZE:
             with open(path, "rb") as f:

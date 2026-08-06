@@ -669,14 +669,20 @@ class DumperApp(tk.Tk):
             return
         self.run_worker(lambda: self._dump(port, banks, mapping, out))
 
-    def _dump(self, port, banks, mapping, out):
+    def _dump(self, port, banks, mapping, out, start_bank=0):
         """バンク単位で読む。各バンクは2回読んで完全一致するまで繰り返す。
 
         確定したバンクは <出力名>.banks/ にキャッシュするので、中断しても再開できる。
+
+        start_bank は読み始めるバンク番号。DSP-1搭載のHiROMカート(スーパーマリオカート等)は
+        $00-$3F の $6000-$7FFF がDSP-1に乗っ取られていてROMが読めないため、DSP-1が居ない
+        $C0 以降のミラーから読み直す必要がある。チェックサムが合わなかったときに自動で試す。
         """
         cache = out + ".banks"
         os.makedirs(cache, exist_ok=True)
-        self.log(f"バンク単位でダンプします（{mapping.upper()} / {banks}バンク）")
+        origin = f"（{mapping.upper()} / {banks}バンク"
+        origin += f" / $%02X から）" % start_bank if start_bank else "）"
+        self.log("バンク単位でダンプします" + origin)
         self.log(f"キャッシュ: {cache}")
 
         dump_start = time.time()
@@ -684,7 +690,8 @@ class DumperApp(tk.Tk):
         adaptive = AdaptiveTiming()
 
         collected = []
-        for b in range(banks):
+        for i in range(banks):
+            b = start_bank + i
             if self.cancel_flag.is_set():
                 return
             path = os.path.join(cache, f"bank_{b:03d}.bin")
@@ -736,6 +743,15 @@ class DumperApp(tk.Tk):
                 if isinstance(c, bytes) and binascii.hexlify(c).decode() == crc:
                     self.log(f"  データベース一致: 『{e['name']}』")
                     break
+
+        # HiROMでチェックサムが合わないときは、DSP-1がバスを乗っ取っている疑いがある。
+        # $00-$3F の $6000-$7FFF はDSP-1の応答になりROMが読めないが、$C0以降のミラーには
+        # DSP-1が居ないので、そちらから読み直せば通る（スーパーマリオカートで実証済み）。
+        if not ok and mapping == "hirom" and start_bank == 0 and not self.cancel_flag.is_set():
+            self.log("チェックサムが合いません。DSP-1搭載カートの可能性があるため、"
+                     "$C0 から読み直します。")
+            self.log("  （DSP-1は $00-$3F の $6000-$7FFF に居座るためROMが隠れます）")
+            return self._dump(port, banks, mapping, out, start_bank=0xC0)
 
         final = out if ok else out + ".unverified"
         with open(final, "wb") as f:
