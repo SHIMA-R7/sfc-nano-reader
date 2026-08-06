@@ -102,7 +102,7 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
 
 
 def read_bank_confirmed(port, bank, total_banks=0, start_idx=0,
-                        cancel_flag=None, log=None, progress=None):
+                        cancel_flag=None, log=None, progress=None, hold_reset=False):
     """バンクを読み、2回連続で完全一致するまで繰り返す。
 
     start_idx で TIMING_TIERS の何番目から試すかを指定できる。前のバンクで分かって
@@ -119,7 +119,8 @@ def read_bank_confirmed(port, bank, total_banks=0, start_idx=0,
         for attempt in range(1, ATTEMPTS_PER_TIER + 1):
             if cancel_flag is not None and cancel_flag.is_set():
                 return None, None, None
-            data = _read_bank_once(port, bank, tier, total_banks, cancel_flag, log)
+            data = _read_bank_once(port, bank, tier, total_banks, cancel_flag, log,
+                                   hold_reset=hold_reset)
             if data is None:
                 continue
             if progress:
