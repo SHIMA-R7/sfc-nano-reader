@@ -158,14 +158,29 @@ def load_entries(path):
 
 
 def default_rdb_paths():
-    """よくある場所の .rdb を候補として返す。"""
+    """よくある場所の .rdb を候補として返す。
+
+    RetroArchはポータブル運用でどこにでも置けるので、インストール先を1箇所に
+    決め打ちすると移動したとたんタイトル検索が黙って壊れる（実際に壊した）。
+    よくある置き場を広めに当たり、最初に見つかったものを使う。
+    環境変数 SFC_DUMPER_RDB があればそれを最優先する。
+    """
     rel = os.path.join("database", "rdb", "Nintendo - Super Nintendo Entertainment System.rdb")
-    candidates = [
-        os.path.join(r"C:\Users", os.environ.get("USERNAME", ""), "Downloads", "RetroArch",
-                     "RetroArch-Win64", rel),
-        os.path.join(os.path.expandvars(r"%APPDATA%"), "RetroArch", rel),
-        os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "RetroArch", rel),
+    home = os.path.expanduser("~")
+    roots = [
+        r"C:\RetroArch",
+        r"C:\RetroArch\RetroArch-Win64",
+        r"C:\Program Files\RetroArch",
+        os.path.join(home, "Downloads", "RetroArch", "RetroArch-Win64"),
+        os.path.join(home, "Downloads", "RetroArch"),
+        os.path.join(os.path.expandvars(r"%APPDATA%"), "RetroArch"),
+        os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "RetroArch"),
     ]
+    candidates = []
+    env = os.environ.get("SFC_DUMPER_RDB")
+    if env:
+        candidates.append(env)
+    candidates += [os.path.join(r, rel) for r in roots]
     return [p for p in candidates if os.path.exists(p)]
 
 
