@@ -126,6 +126,9 @@ python host/dump_until_valid.py --port COM12 --banks 32 --mapping hirom --out My
 
 ### セーブデータ（バッテリーバックアップSRAM）の吸い出し
 
+GUIの「5. セーブデータ」から実行できます。「カートを判定」を先に押すと、ヘッダから容量を
+読んでボタンが有効になります。CLIなら:
+
 ```bash
 python host/dump_sram.py --port COM12 --rom MyGame.sfc --out MyGame.srm
 ```

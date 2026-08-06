@@ -97,15 +97,19 @@ def read_header(rom, off):
     title = rom[off:off + 21]
     map_mode = rom[off + 0x15]
     rom_size_byte = rom[off + 0x17]
+    sram_size_byte = rom[off + 0x18]
     complement = rom[off + 28] | (rom[off + 29] << 8)
     checksum = rom[off + 30] | (rom[off + 31] << 8)
     if ((checksum + complement) & 0xFFFF) != 0xFFFF or checksum == 0:
         return None
     printable = sum(1 for b in title if 0x20 <= b < 0x7F)
+    # SRAM容量は 1024 << n。0なら電池バックアップ無し。異常に大きい値はヘッダ誤読なので捨てる
+    sram_bytes = (1024 << sram_size_byte) if 0 < sram_size_byte <= 12 else 0
     return {
         "title": title.decode("shift_jis", errors="replace").strip(),
         "map_mode": map_mode,
         "size_kb": 1 << rom_size_byte if rom_size_byte < 20 else None,
+        "sram_bytes": sram_bytes,
         "checksum": checksum,
         "printable": printable,
     }
@@ -172,8 +176,8 @@ class DumperApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("SFC Cartridge Dumper — Nano x3")
-        self.geometry("900x820")
-        self.minsize(780, 700)
+        self.geometry("900x880")
+        self.minsize(780, 760)
 
         self.log_queue = queue.Queue()
         self.worker = None
@@ -183,6 +187,7 @@ class DumperApp(tk.Tk):
         self.db_entries = None      # 遅延読み込み
         self.db_hits = []
         self.db_size_bytes = None   # DBで選んだタイトルの実サイズ
+        self.sram_bytes = 0         # 判定で読み取ったセーブ用SRAMの容量
 
         self._build_ui()
         self.refresh_ports()
@@ -270,6 +275,22 @@ class DumperApp(tk.Tk):
         self.dump_btn.pack(side="left", padx=6)
         self.cancel_btn = ttk.Button(btns, text="中止", command=self.cancel, state="disabled")
         self.cancel_btn.pack(side="left")
+
+        # セーブデータ(SRAM)
+        sram = ttk.LabelFrame(self, text="5. セーブデータ（バッテリーバックアップSRAM）")
+        sram.pack(fill="x", **pad)
+        ttk.Label(sram,
+                  text="ROMは焼き直せば手に入りますが、セーブは世界に1つです。"
+                       "カートの電池が切れると永久に失われます。",
+                  foreground="#666").grid(row=0, column=0, columnspan=4, sticky="w", padx=6, pady=(6, 0))
+        self.sram_info = tk.StringVar(value="「カートを判定」を実行すると容量が分かります")
+        ttk.Label(sram, textvariable=self.sram_info).grid(row=1, column=0, columnspan=4,
+                                                          sticky="w", padx=6, pady=4)
+        self.sram_btn = ttk.Button(sram, text="セーブデータを吸い出す",
+                                   command=self.start_sram_dump)
+        self.sram_btn.grid(row=2, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(sram, text="※ /WR は+5Vに直結してあるため、書き込み事故は物理的に起こりません",
+                  foreground="#666").grid(row=2, column=1, columnspan=3, sticky="w", padx=6)
 
         # 進捗
         prog = ttk.Frame(self)
@@ -393,6 +414,7 @@ class DumperApp(tk.Tk):
         state = "disabled" if busy else "normal"
         self.identify_btn.config(state=state)
         self.dump_btn.config(state=state)
+        self.sram_btn.config(state=state)
         self.cancel_btn.config(state="normal" if busy else "disabled")
 
     def cancel(self):
@@ -506,6 +528,16 @@ class DumperApp(tk.Tk):
                  f"/ チェックサム 0x{hdr['checksum']:04x}")
 
         self.mapping_var.set(mapping)
+        self.sram_bytes = hdr["sram_bytes"]
+        if self.sram_bytes:
+            self.log(f"  セーブ用SRAM {self.sram_bytes // 1024} KB を検出しました。")
+            self.after(0, lambda: self.sram_info.set(
+                f"『{hdr['title']}』 SRAM {self.sram_bytes // 1024} KB "
+                f"（{mapping.upper()}）— 吸い出せます"))
+        else:
+            self.log("  このカートにセーブ用SRAMはありません。")
+            self.after(0, lambda: self.sram_info.set(
+                f"『{hdr['title']}』 — セーブ領域なし"))
 
         if self.db_size_bytes:
             self.log("  データベースで選択済みのサイズを優先します。")
@@ -522,6 +554,97 @@ class DumperApp(tk.Tk):
                 self.out_var.set(os.path.join(PROJECT_ROOT, safe + ".sfc"))
             self.query_var.set(hdr["title"])
             self.after(0, self.search_db)
+
+    def start_sram_dump(self):
+        port = self.selected_port()
+        if not port:
+            messagebox.showerror("ポート未選択", "シリアルポートを選んでください。")
+            return
+        mapping = self.mapping_var.get()
+        if mapping == "auto":
+            messagebox.showerror("マッピング未確定",
+                                 "先に「カートを判定」を実行してください。\n"
+                                 "SRAMの位置と /ROMSEL の極性がマッピングで変わるためです。")
+            return
+        if not self.sram_bytes:
+            messagebox.showerror("SRAM容量が不明",
+                                 "先に「カートを判定」を実行してください。\n"
+                                 "判定してもSRAMなしと出る場合、このカートにセーブ領域はありません。")
+            return
+        default = os.path.splitext(self.out_var.get() or
+                                   os.path.join(PROJECT_ROOT, "save"))[0] + ".srm"
+        out = filedialog.asksaveasfilename(
+            title="セーブデータの保存先", defaultextension=".srm",
+            initialfile=os.path.basename(default), initialdir=os.path.dirname(default),
+            filetypes=[("セーブデータ", "*.srm"), ("すべて", "*.*")])
+        if not out:
+            return
+        self.run_worker(lambda: self._dump_sram(port, mapping, self.sram_bytes, out))
+
+    def _dump_sram(self, port, mapping, size, out):
+        """セーブ用SRAMを読む。
+
+        /ROMSEL の極性はマッピングで逆になる。SNESの /CART はバンク $40-$7D では
+        全アドレスでアサートされるが、$00-$3F では $8000-$FFFF のときだけ。よって
+        LoROMのSRAM($70:0000)はアサートする側、HiROMのSRAM($20:6000)はしない側になる。
+        """
+        if mapping == "hirom":
+            bank, no_romsel, window_off, window_len = 0x20, True, 0x6000, 0x2000
+        else:
+            bank, no_romsel, window_off, window_len = 0x70, False, 0x0000, 0x8000
+
+        self.log(f"セーブデータを読みます（{mapping.upper()} / {size // 1024}KB / "
+                 f"バンク ${bank:02X} / /ROMSEL {'非アサート' if no_romsel else 'アサート'}）")
+
+        def progress(got, total):
+            self.after(0, lambda: self.progress.config(maximum=total, value=got))
+            self.status_var.set(f"SRAM {got * 100 // total}%")
+
+        prev = None
+        for attempt in range(1, 7):
+            if self.cancel_flag.is_set():
+                return
+            raw = _read_bank_once(port, bank, TIMING_TIERS[0], cancel_flag=self.cancel_flag,
+                                  log=self.log, sram=no_romsel)
+            if raw is None:
+                self.log(f"  試行{attempt}: 読み出せませんでした")
+                continue
+            progress(len(raw), len(raw))
+            window = raw[window_off:window_off + window_len]
+            if size > len(window):
+                self.log(f"  SRAM容量({size})が窓({len(window)})より大きく、扱えません。")
+                return
+            body = window[:size]
+
+            # ミラーは「1回の読み出しだけで完結する」補助的な検査。カートによっては
+            # SRAM外がオープンバスになりミラーが出ないので、判定の主軸にはしない。
+            mirrors = [window[i:i + size] for i in range(size, len(window) - size + 1, size)]
+            bad = sum(1 for m in mirrors if m != body)
+            hint = (f"ミラー{len(mirrors)}個すべて一致" if mirrors and bad == 0
+                    else f"ミラー{bad}/{len(mirrors)}個が不一致" if mirrors else "ミラーなし")
+
+            if prev is not None and prev == body:
+                self.log(f"  試行{attempt}: 2回一致 / {hint}")
+                if all(b == body[0] for b in body):
+                    self.log(f"  ※ 全バイトが 0x{body[0]:02x} です。SRAMに届いていないか、"
+                             "セーブが空の可能性があります。")
+                with open(out, "wb") as f:
+                    f.write(body)
+                self.log(f"保存: {out} ({len(body)}バイト)")
+                self.log("  RetroArchで使うには saves/<コア名>/<ROMと同じ名前>.srm に置きます。")
+                self.after(0, lambda: messagebox.showinfo(
+                    "セーブ吸い出し成功", f"{len(body)}バイトを保存しました。\n{out}"))
+                return
+            if prev is not None:
+                diff = sum(1 for a, b in zip(prev, body) if a != b)
+                self.log(f"  試行{attempt}: 前回と {diff} バイト相違 / {hint}")
+            else:
+                self.log(f"  試行{attempt}: {hint}。もう1回読んで確認します")
+            prev = body
+
+        self.log("一致を得られませんでした。接触を確認してもう一度試してください。")
+        self.after(0, lambda: messagebox.showerror(
+            "セーブ吸い出し失敗", "2回連続で一致する読み出しが得られませんでした。"))
 
     def start_dump(self):
         port = self.selected_port()
