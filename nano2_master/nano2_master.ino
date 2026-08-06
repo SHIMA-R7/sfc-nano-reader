@@ -16,9 +16,12 @@ const uint8_t ROMSEL_PIN = 3;
 const uint8_t STROBE_PIN = 4;
 // 旧DATA/CLK/LATCHのシフトレジスタ方式は非同期タイミングのレースで不安定だったため廃止。
 // 配線はそのまま流用し、旧BANK_DATA線をRESET、旧BANK_CLK線をSTROBEとして使う(Nano-1と同じ方式)。
-// 旧BANK_LATCH線(D7→Nano-3 D12)は未使用のまま放置。
 const uint8_t BANK_RESET_PIN = 5;
 const uint8_t BANK_STROBE_PIN = 6;
+// 旧BANK_LATCH線(D7)はNano-3のD12から切り離し、カートの /RESET へ引き直した。
+// カート側で +5V に直結していた線は撤去済み(残したままここをLowにすると電源とショートする)。
+// 通常はHighに保つ。コプロ(Super FX / SA-1)をリセット状態に保持してROMを覗きたいときだけLow。
+const uint8_t CART_RESET_PIN = 7;
 const uint8_t D6_PIN = 8;
 const uint8_t D7_PIN = 9;
 const uint8_t DATA_LOW_PINS[6] = {A0, A1, A2, A3, A4, A5}; // cart D0-D5
@@ -146,6 +149,12 @@ uint8_t readByte() {
 }
 
 void setup() {
+  // /RESET はアクティブLow。先にポートビットを立ててから出力に切り替えると、
+  // 一瞬もLowを出さずに済む。逆順だと数サイクルLowが出てカート内のチップが不用意に
+  // リセットされる。なお電源投入からここに来るまでの間はINPUTのまま浮いている。
+  digitalWrite(CART_RESET_PIN, HIGH);
+  pinMode(CART_RESET_PIN, OUTPUT);
+
   pinMode(RD_PIN, OUTPUT); digitalWrite(RD_PIN, HIGH);
   pinMode(ROMSEL_PIN, OUTPUT); digitalWrite(ROMSEL_PIN, HIGH);
   pinMode(STROBE_PIN, OUTPUT); digitalWrite(STROBE_PIN, LOW);
@@ -174,6 +183,7 @@ void setup() {
   // ではなく、PC側がカートごとに「まず速い設定で試し、駄目なら段階的に上げる」ために毎回
   // 送ってくる。全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出しには無関係）。
   // フラグのbit0が立っていればSRAM(セーブデータ)モード = /ROMSEL をアサートしない。
+  // bit1が立っていれば読み出し中ずっとカートの /RESET をLowに保持する(コプロ実験用)。
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
@@ -188,9 +198,16 @@ void setup() {
   addrSettleUs = (uint16_t)(hdr[4] | (hdr[5] << 8));
   pulseUs      = (uint16_t)(hdr[6] | (hdr[7] << 8));
   sramMode     = (hdr[8] & 0x01) != 0;
+  const bool holdReset = (hdr[8] & 0x02) != 0;
+
+  // コプロを止めたままROMが覗けるか試すためのモード。バスを明け渡すかはチップ次第で、
+  // 通るかどうかは実測するしかない。通常のROMカートでは /RESET は無関係。
+  if (holdReset) digitalWrite(CART_RESET_PIN, LOW);
 
   char line[17];
-  if (sramMode) {
+  if (holdReset) {
+    snprintf(line, sizeof(line), "RST Bank $%02X  ", (unsigned)target);
+  } else if (sramMode) {
     snprintf(line, sizeof(line), "SRAM bank $%02X ", (unsigned)target);
   } else if (totalBanks > 0) {
     snprintf(line, sizeof(line), "Bank %3u/%3u  ", (unsigned)target + 1, (unsigned)totalBanks);
