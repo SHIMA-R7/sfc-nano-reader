@@ -229,6 +229,61 @@ uint8_t obsLo, obsHi;        // 観測した電圧の範囲(0-255に丸め)
 uint8_t obsTransitions;      // Low↔Highの遷移回数。0でHigh維持なら本物
 bool obsEndedHigh;
 
+// ── 簡易ロジックアナライザ ──────────────────────────────────────────
+// analogRead()は1回に約100usかかる。CICの握手はそれよりずっと速く進むので、
+// 「Low固定に見えた」のは単に速すぎて見えていなかっただけの可能性がある。
+//
+// ADCを毎回起動・停止するのをやめ、フリーランニング(連続変換)モードにすると
+// 1変換13クロック。プリスケーラ8で16MHz/8=2MHz、つまり約6.5us間隔まで詰められる。
+// 8bit精度(ADLARで上位バイトだけ読む)で十分——見たいのはHigh/Lowだけなので。
+//
+// 1サンプル1ビットに潰してRAMへ詰めるので、900バイトで7200サンプル＝約47ms分。
+// CICの握手は内部計算を挟みながら進むので、開始部分を捉えるにはこれで足りる。
+#define LA_BYTES 900
+uint8_t laBuf[LA_BYTES];
+
+// ch: 6=A6(CICの10番/リセット出力) 7=A7(CICのデータ線)
+static void logicCapture(uint8_t ch, bool activeLow, uint8_t decim) {
+  // ADC設定: 基準電圧AVCC、左詰め(上位8bitだけ読む)、指定チャンネル
+  ADMUX = _BV(REFS0) | _BV(ADLAR) | (ch & 0x0F);
+  ADCSRB = 0;                                   // フリーランニング
+  // ADEN=有効 ADATE=自動トリガ ADPS=8分周(2MHz)。まだ開始しない。
+  ADCSRA = _BV(ADEN) | _BV(ADATE) | _BV(ADPS1) | _BV(ADPS0);
+
+  // 初回変換は25クロックかかる上、チャンネル切替直後の値は当てにならない。
+  // 捨て変換を数回まわしてから本番に入る。ここを省いて同じ古い値を読み続け、
+  // 「完全に静止」という誤った観測を得ていた。
+  ADCSRA |= _BV(ADSC);
+  for (uint8_t i = 0; i < 4; i++) {
+    while (!(ADCSRA & _BV(ADIF))) { }
+    ADCSRA |= _BV(ADIF);
+  }
+
+  // リセットを解除して、その瞬間から記録を始める。時間の基準点になる。
+  //
+  // 極性を引数で受けるのは、以前「アクティブLowで確定」と判断した根拠が、
+  // 7-8番ピンが短絡していた時期の観測だったため。あの時はRSTピンにクロックが
+  // 乗っていて、どちらの極性を指定してもチップは叩かれ続けていた。判定は無効。
+  pinMode(CIC_RST_PIN, OUTPUT);
+  digitalWrite(CIC_RST_PIN, activeLow ? LOW : HIGH);
+  delay(20);
+  digitalWrite(CIC_RST_PIN, activeLow ? HIGH : LOW);
+
+  // 閾値で潰さず、8bitの生値をそのまま記録する。
+  // 「完全に静止」という結果が測定系のバグなのか本当に信号が無いのかを、
+  // 二値化した後のデータからは区別できない。生値なら中間電位もノイズも見える。
+  // decim個に1個だけ記録して観測窓を伸ばす。握手の開始が遅い場合、
+  // 6.5us刻みの5.8msでは窓の外に出てしまうため。
+  for (uint16_t i = 0; i < LA_BYTES; i++) {
+    for (uint8_t d = 0; d < decim; d++) {
+      while (!(ADCSRA & _BV(ADIF))) { /* 変換完了待ち */ }
+      laBuf[i] = ADCH;
+      ADCSRA |= _BV(ADIF);
+    }
+  }
+  ADCSRA = 0;   // ADCを止めて通常のanalogRead()に戻せるようにする
+}
+
 static void cicObserve(bool activeLow, uint16_t windowMs) {
   pinMode(CIC_RST_PIN, OUTPUT);
   digitalWrite(CIC_RST_PIN, activeLow ? LOW : HIGH);
@@ -301,6 +356,9 @@ void setup() {
   // フラグのbit0が立っていればSRAM(セーブデータ)モード = /ROMSEL をアサートしない。
   // bit1が立っていれば読み出し中ずっとカートの /RESET をLowに保持する(コプロ実験用)。
   // 10バイト目はカートへ供給するクロックの分周値(OCR2A)。
+  // bit4が立っていればロジックアナライザモード。CICのリセットを解除した瞬間から
+  //   約6.5us間隔でピンを記録し、900バイト(7200サンプル)を返す。
+  //   hdr[1]の下位1bitで対象を選ぶ: 0=A6(10番/リセット出力) 1=A7(データ線)
   // bit3が立っていればCIC(F411A)を起動し、認証の成否を1バイト('A'/'N')返してから
   //   データを流す。SA-1カート用。クロックも自動で有効になる(CICはクロックが要るため)。
   // bit2が立っていればカートへクロックを供給する。既定は供給しない。
@@ -327,6 +385,16 @@ void setup() {
   //   n=7 -> 1MHz / n=3 -> 2MHz / n=2 -> 2.67MHz / n=1 -> 4MHz / n=0 -> 8MHz
   // CICの公称は3.072MHzだが16MHzからは整数分周で作れないので、近い値を掃引して探す。
   if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9]);
+
+  const bool laMode = (hdr[8] & 0x10) != 0;
+  if (laMode) {
+    delay(50);                       // クロックが安定するのを待つ
+    // hdr[1] bit0=観測対象(0:A6 1:A7)  bit1=RST極性(0:アクティブLow 1:アクティブHigh)
+    logicCapture((hdr[1] & 1) ? 7 : 6, (hdr[1] & 2) == 0,
+                 hdr[1] >> 2 ? hdr[1] >> 2 : 1);  // bit2以上=間引き率
+    Serial.write(laBuf, LA_BYTES);
+    while (1) { /* 記録を返したら停止 */ }
+  }
 
   if (cicMode) {
     // クロックが安定してからリセットを解除したいので少し待つ
