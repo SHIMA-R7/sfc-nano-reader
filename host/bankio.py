@@ -46,7 +46,8 @@ def _is_degenerate(data):
 
 
 def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
-                    sram=False, hold_reset=False, cart_clock=False):
+                    sram=False, hold_reset=False, cart_clock=False, cic=False,
+                    clock_ocr=7):
     """指定タイミングで1回読む。失敗したら None。
 
     total_banks は読み出しには使わず、OLEDに「現在/全体」を表示させるためだけに送る。
@@ -57,6 +58,13 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
     SA-1)を止めたままROMが覗けるかを試すための実験用。
     cart_clock=True でカートへ1MHzを供給する。Super FXでは逆効果(GSUが起きてバスを奪う)
     だったが、SA-1やCIC認証には必要になるため切り替え可能にしてある。
+
+    cic=True で本体基板から取り外したCIC(F411A)を起動し、SA-1が要求する認証を通しにいく。
+    clock_ocr はカートへ供給するクロックの分周値。16MHz/(2*(1+n)) が出力周波数で、
+    7=1MHz / 3=2MHz / 2=2.67MHz / 1=4MHz / 0=8MHz。CICの公称3.072MHzは16MHzから
+    整数分周で作れないため、近い値を掃引して通る点を探す。
+    ファームはデータの前に1バイト('A'=認証成立 / 'N'=不成立)を返す。ROMが読めるかどうかとは
+    別に握手の成否だけを切り分けられるので、配線やクロックの当たりを付けるのに使う。
     """
     rd_us, addr_us, pulse_us, _ = tier
     try:
@@ -84,10 +92,29 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
             addr_us & 0xFF, (addr_us >> 8) & 0xFF,
             pulse_us & 0xFF, (pulse_us >> 8) & 0xFF,
             ((0x01 if sram else 0x00) | (0x02 if hold_reset else 0x00)
-             | (0x04 if cart_clock else 0x00)),
+             | (0x04 if cart_clock else 0x00) | (0x08 if cic else 0x00)),
+            clock_ocr & 0xFF,
         ])
         ser.write(header)
         ser.flush()
+
+        if cic:
+            st = ser.read(8)
+            if log:
+                if len(st) != 8:
+                    log(f"    CIC: 応答なし {st!r}")
+                else:
+                    v = lambda x: x * 4 * 5.0 / 1023
+                    for k, name in ((0, "10番 本体リセット出力  "), (4, "1番 CICデータ線      ")):
+                        lo, hi, tr, eh = st[k], st[k+1], st[k+2], st[k+3]
+                        # 遷移0回でHigh維持なら本物。振動していればリセットループ=認証失敗。
+                        if tr == 0 and hi > 200:
+                            verdict = "High固定"
+                        elif tr == 0:
+                            verdict = "Low固定"
+                        else:
+                            verdict = f"振動{tr}回"
+                        log(f"    CIC[{name}] {v(lo):.2f}〜{v(hi):.2f}V {verdict}")
 
         buf = bytearray()
         while len(buf) < BANK_SIZE:

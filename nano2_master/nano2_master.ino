@@ -38,8 +38,46 @@ const uint8_t ADDR_RESET_PIN = 10; // Nano-1のアドレスカウンタを0に�
 // 追い出してD11を空けた。実機の21.477MHzである必要はなく、OSCRもカートを1MHzで走らせている。
 const uint8_t CART_CLK_PIN = 11;
 
+// OLEDは休止中。D11をカートのクロック出力に明け渡した際、データ線をD13へ移したが、
+// D13にはNano基板上のLEDと抵抗がぶら下がっていて駆動が足りず表示できなくなった。
+// Nano-2に他の空きピンは無いため、進捗表示を諦めてD12/D13をCIC制御へ回す。
+// 1に戻せば元の配線(clock=12,data=11)で復活するが、その場合カートクロックは使えない。
+#define USE_OLED 0
+
+#if USE_OLED
 #include <U8x8lib.h>
-U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 13, /*reset=*/ U8X8_PIN_NONE);
+U8X8_SH1106_128X64_NONAME_SW_I2C oled(/*clock=*/ 12, /*data=*/ 11, /*reset=*/ U8X8_PIN_NONE);
+#else
+// 呼び出し側を #if で汚さずに済ませるための何もしない代替。
+static const uint8_t *u8x8_font_chroma48medium8_r = nullptr;
+struct OledStub {
+  void begin() {}
+  void clear() {}
+  void setFont(const uint8_t *) {}
+  void drawString(uint8_t, uint8_t, const char *) {}
+  void draw2x2String(uint8_t, uint8_t, const char *) {}
+  void setInverseFont(uint8_t) {}
+} oled;
+#endif
+
+// ── CIC(F411A)の制御 ────────────────────────────────────────────────
+// SA-1はROMを開示する前に、自分のCICを介して本物の本体と通信していることを検証する。
+// 本体基板から取り外したF411Aを繋ぎ、その検証相手を務めさせるための配線。
+//
+//   CIC 8番(RST)  <- D12    リセットを解除すると認証が始まる
+//   CIC 10番(/RESET出力) -> A6   認証に失敗している間Lowのまま
+//   CIC 7番(CLK)  <- D11    カートの56番/57番と同じクロックを分岐して供給
+//
+// A6を使うのはNanoの入力専用ピンだから。出力に使えず今まで遊んでいた。
+// D13を避けるのは上記のLEDのため。監視線に余計な負荷を掛けたくない。
+const uint8_t CIC_RST_PIN = 12;
+const uint8_t CIC_OK_PIN = A6;   // analogRead専用。digitalReadは使えない
+// A7は用途を付け替えながら使う唯一の観測窓。今はCICのデータ線(1番)を見ている。
+// 11番(カート側CICのリセット)を見たときは、1MHz以下でHigh固定＝Key側は解除されて
+// 動いていることが確認できた。次に知りたいのは「両者が実際に喋っているか」なので、
+// データ線に移した。振動していれば通信は起きていて中身が合わないだけ、静止していれば
+// どちらかが応答していない。
+const uint8_t CIC_PROBE_PIN = A7;
 
 // 16MHz / (2 * (1 + OCR2A)) = 出力周波数。7で1MHz、1で4MHz、0で8MHz。
 void startCartClock(uint8_t ocr) {
@@ -166,6 +204,66 @@ uint8_t readByte() {
   return v;
 }
 
+// CICを起動して認証の成立を待つ。戻り値は成立したかどうか。
+//
+// 10番ピンは本体のリセット線を駆動する出力で、CICは認証が通らない限りここをLowに
+// 保持し続ける。つまり**ROMを読む前に握手の成否だけを切り分けられる**。
+// これが無いと「読めない」という結果だけを見て、認証・配線・クロックのどれが悪いのか
+// 区別できなくなる。
+// 監視ピンの実測値の範囲も返す。'成立/不成立'の一言だけだと、A6がCICを本当に読めて
+// いるのか(繋がっていて常にLow)、それとも浮いてノイズを拾っているだけなのかが分からない。
+// 実測の最小値・最大値が分かれば、固定Low・固定High・不安定のどれかを判別できる。
+// リセットを解除したあと、監視ピンが実際に何をしているかを1秒間観測して返す。
+//
+// 二値の「成立/不成立」を判定条件で決めようとして三度失敗した(2.5V閾値・4.4V瞬時・
+// 200ms保持)。いずれも失敗モード側が条件を満たせてしまう。CICは認証に失敗すると本体を
+// リセットし続けるので出力は振動し、クロックを落とすほどその周期が伸びて、どんな
+// 「一定時間High」条件もいつかは通過してしまう。
+//
+// なので判定をやめて波形を測る。認証が通ったならリセットは恒久的に解除され、遷移は
+// 起きないはず。失敗しているなら往復が観測される。
+// Arduinoのプリプロセッサは構造体定義より前に関数プロトタイプを差し込むため、
+// 自作型を引数に取るとコンパイルが通らない。素直にグローバルで受け渡す。
+uint8_t obsKeyLo, obsKeyHi, obsKeyTransitions;  // 11番(カート側CICのリセット)の観測
+uint8_t obsLo, obsHi;        // 観測した電圧の範囲(0-255に丸め)
+uint8_t obsTransitions;      // Low↔Highの遷移回数。0でHigh維持なら本物
+bool obsEndedHigh;
+
+static void cicObserve(bool activeLow, uint16_t windowMs) {
+  pinMode(CIC_RST_PIN, OUTPUT);
+  digitalWrite(CIC_RST_PIN, activeLow ? LOW : HIGH);
+  delay(20);
+  digitalWrite(CIC_RST_PIN, activeLow ? HIGH : LOW);
+
+  uint16_t mn = 1023, mx = 0, kmn = 1023, kmx = 0;
+  uint8_t tr = 0, ktr = 0;
+  bool prevHigh = false, kPrevHigh = false, first = true;
+  const uint32_t deadline = millis() + windowMs;
+  while (millis() < deadline) {
+    const uint16_t v = analogRead(CIC_OK_PIN);
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+    const bool h = (v > 900);
+    if (!first && h != prevHigh && tr < 255) tr++;
+    prevHigh = h;
+
+    const uint16_t k = analogRead(CIC_PROBE_PIN);
+    if (k < kmn) kmn = k;
+    if (k > kmx) kmx = k;
+    const bool kh = (k > 900);
+    if (!first && kh != kPrevHigh && ktr < 255) ktr++;
+    kPrevHigh = kh;
+    first = false;
+  }
+  obsKeyLo = (uint8_t)(kmn >> 2);
+  obsKeyHi = (uint8_t)(kmx >> 2);
+  obsKeyTransitions = ktr;
+  obsLo = (uint8_t)(mn >> 2);
+  obsHi = (uint8_t)(mx >> 2);
+  obsTransitions = tr;
+  obsEndedHigh = prevHigh;
+}
+
 void setup() {
   // /RESET はアクティブLow。先にポートビットを立ててから出力に切り替えると、
   // 一瞬もLowを出さずに済む。逆順だと数サイクルLowが出てカート内のチップが不用意に
@@ -202,6 +300,9 @@ void setup() {
   // 送ってくる。全バンク数はOLEDに「現在/全体」を表示するためだけに使う（読み出しには無関係）。
   // フラグのbit0が立っていればSRAM(セーブデータ)モード = /ROMSEL をアサートしない。
   // bit1が立っていれば読み出し中ずっとカートの /RESET をLowに保持する(コプロ実験用)。
+  // 10バイト目はカートへ供給するクロックの分周値(OCR2A)。
+  // bit3が立っていればCIC(F411A)を起動し、認証の成否を1バイト('A'/'N')返してから
+  //   データを流す。SA-1カート用。クロックも自動で有効になる(CICはクロックが要るため)。
   // bit2が立っていればカートへクロックを供給する。既定は供給しない。
   //   Super FXでは供給すると逆効果だった。クロックが無い間GSUは眠っていてROMが見えるが、
   //   与えた途端に起きてバスを完全に奪い、読めるのはオープンバスだけになる。
@@ -209,8 +310,8 @@ void setup() {
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
-  uint8_t hdr[9];
-  for (uint8_t i = 0; i < 9; i++) {
+  uint8_t hdr[10];
+  for (uint8_t i = 0; i < 10; i++) {
     while (Serial.available() == 0) { /* 待機 */ }
     hdr[i] = (uint8_t)Serial.read();
   }
@@ -221,7 +322,24 @@ void setup() {
   pulseUs      = (uint16_t)(hdr[6] | (hdr[7] << 8));
   sramMode     = (hdr[8] & 0x01) != 0;
   const bool holdReset = (hdr[8] & 0x02) != 0;
-  if (hdr[8] & 0x04) startCartClock(7); // 1MHz
+  const bool cicMode = (hdr[8] & 0x08) != 0;
+  // hdr[9] はクロックの分周値(OCR2A)。16MHz/(2*(1+n)) が出力周波数になる。
+  //   n=7 -> 1MHz / n=3 -> 2MHz / n=2 -> 2.67MHz / n=1 -> 4MHz / n=0 -> 8MHz
+  // CICの公称は3.072MHzだが16MHzからは整数分周で作れないので、近い値を掃引して探す。
+  if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9]);
+
+  if (cicMode) {
+    // クロックが安定してからリセットを解除したいので少し待つ
+    delay(50);
+    // 両方の極性を1秒ずつ観測して、生の結果をそのまま返す。判定はPC側で行う。
+    // RSTはアクティブLowで確定済みなので、そちらだけ観測して10番と11番の両方を返す。
+    cicObserve(true, 1000);
+    Serial.write(obsLo); Serial.write(obsHi);
+    Serial.write(obsTransitions); Serial.write(obsEndedHigh ? 1 : 0);
+    Serial.write(obsKeyLo); Serial.write(obsKeyHi);
+    Serial.write(obsKeyTransitions); Serial.write((uint8_t)0);
+    // 認証が通らなくてもデータは流す。何が返ってくるかを見たいので。
+  }
 
   // コプロを止めたままROMが覗けるか試すためのモード。バスを明け渡すかはチップ次第で、
   // 通るかどうかは実測するしかない。通常のROMカートでは /RESET は無関係。
