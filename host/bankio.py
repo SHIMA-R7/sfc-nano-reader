@@ -47,7 +47,7 @@ def _is_degenerate(data):
 
 def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
                     sram=False, hold_reset=False, cart_clock=False, cic=False,
-                    clock_ocr=7):
+                    clock_ocr=7, prime=False):
     """指定タイミングで1回読む。失敗したら None。
 
     total_banks は読み出しには使わず、OLEDに「現在/全体」を表示させるためだけに送る。
@@ -92,7 +92,8 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
             addr_us & 0xFF, (addr_us >> 8) & 0xFF,
             pulse_us & 0xFF, (pulse_us >> 8) & 0xFF,
             ((0x01 if sram else 0x00) | (0x02 if hold_reset else 0x00)
-             | (0x04 if cart_clock else 0x00) | (0x08 if cic else 0x00)),
+             | (0x04 if cart_clock else 0x00) | (0x08 if cic else 0x00)
+             | (0x20 if prime else 0x00)),
             clock_ocr & 0xFF,
         ])
         ser.write(header)

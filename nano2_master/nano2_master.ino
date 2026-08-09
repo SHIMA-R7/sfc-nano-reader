@@ -27,16 +27,25 @@ const uint8_t D7_PIN = 9;
 const uint8_t DATA_LOW_PINS[6] = {A0, A1, A2, A3, A4, A5}; // cart D0-D5
 const uint8_t ADDR_RESET_PIN = 10; // Nano-1のアドレスカウンタを0に戻す
 
-// カートへ供給するクロック(PHI2 / カート57番)。
-// マスクROMは非同期なので不要だが、コプロ搭載カートは中のチップが同期回路なので、
-// クロックが来ないとリセットすら伝わらず、ROMを正しく通してくれない。
-// Super FXのスターフォックスで、タイミングを変えても電源を強化しても /RESET を叩いても
-// 約920バイト/バンクが0xFFのまま残ったのが、この仮説に至った経緯。
+// 配線替え: このピンは元々カート57番(PHI2/SYSCK)に繋いでいたが、
+// SA-1の解錠中にSYSCKを供給するとデータが壊れるという報告があったため、
+// カート1番(MCK)へ繋ぎ直した。SA-1には自前の発振子が無く、MCKが無いと
+// チップ全体がただの箱になる。CIC認証だけが通ってROMが0のままだった
+// 症状は、これで説明がつく。
 //
-// D11でなければならない理由: 1MHzはソフトでは出せずタイマーのハードウェア出力が要る。
-// Nano-2で解放できるタイマー出力ピンはOC2A(=D11)だけ。そのためOLEDのデータ線をD13へ
-// 追い出してD11を空けた。実機の21.477MHzである必要はなく、OSCRもカートを1MHzで走らせている。
+// D11でなければならない理由: ソフトでは出せずタイマーのハードウェア出力が要る。
+// Nano-2で解放できるタイマー出力ピンはOC2A(=D11)だけ。
+//
+// 実機のMCKは21.477MHzだが、AVR(16MHz)のタイマーで単純トグルできる上限は
+// 8MHz(Fclk/2)なので正確には出せない。OSCRは解錠時にあえて4MHzへ落として
+// 供給し、成功後に21.477MHzへ戻している実績があるため、解錠時は4MHzで試す
+// (startCartClockのocr=1が4MHz)。
 const uint8_t CART_CLK_PIN = 11;
+
+// カート33番(REFRESH)。SA-1に必要、Low固定で出力する。
+// D13は基板上のLED+抵抗が乗るが、ここは静的なLow出力なので問題ない
+// (OLEDデータ線や監視線のような双方向・高速・微弱信号ではない)。
+const uint8_t REFRESH_PIN = 13;
 
 // OLEDは休止中。D11をカートのクロック出力に明け渡した際、データ線をD13へ移したが、
 // D13にはNano基板上のLEDと抵抗がぶら下がっていて駆動が足りず表示できなくなった。
@@ -332,6 +341,7 @@ void setup() {
   pinMode(BANK_RESET_PIN, OUTPUT); digitalWrite(BANK_RESET_PIN, LOW);
   pinMode(BANK_STROBE_PIN, OUTPUT); digitalWrite(BANK_STROBE_PIN, LOW);
   pinMode(ADDR_RESET_PIN, OUTPUT); digitalWrite(ADDR_RESET_PIN, LOW);
+  pinMode(REFRESH_PIN, OUTPUT); digitalWrite(REFRESH_PIN, LOW);  // SA-1に必要
   setDataPinsInput();
 
   oled.begin();
@@ -412,6 +422,20 @@ void setup() {
   // コプロを止めたままROMが覗けるか試すためのモード。バスを明け渡すかはチップ次第で、
   // 通るかどうかは実測するしかない。通常のROMカートでは /RESET は無関係。
   if (holdReset) digitalWrite(CART_RESET_PIN, LOW);
+
+  // SA-1向けの「慣らし」。OSCR(sanni/cartreader)が実際に行っている手順で、
+  // MCK供給・CIC認証が済んだ直後、バンク$C0で1024回ダミーアクセスしてから
+  // 本読みに入る。これが無いと最初の数バイトで安定しないことがあるとされる。
+  const bool primeMode = (hdr[8] & 0x20) != 0;
+  if (primeMode) {
+    resetNano1Addr();
+    resetNano3Bank();
+    for (uint16_t b = 0; b < 0xC0; b++) pulseBankStrobe();
+    for (uint16_t a = 0; a < 1024; a++) {
+      readByte();
+      pulseStrobe();
+    }
+  }
 
   char line[17];
   if (holdReset) {
