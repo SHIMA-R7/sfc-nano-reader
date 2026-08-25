@@ -47,6 +47,24 @@ const uint8_t CART_CLK_PIN = 11;
 // (OLEDデータ線や監視線のような双方向・高速・微弱信号ではない)。
 const uint8_t REFRESH_PIN = 13;
 
+// 起動時からカートへ出すクロックの分周値。-1 で「読み出し時だけ」。
+// 16MHz/(2*(1+n)) が出力周波数。1=4MHz / 3=2MHz / 7=1MHz / 0=8MHz。
+//
+// **既定は -1（無効）。** Super FX ではカートへのクロックは有害で、与えた途端に
+// GSUが起きてバスを完全に奪う（README「カートへのクロック供給は Super FX には逆効果」）。
+// 全カートに無条件で流すわけにはいかない。
+//
+// なお、これを有効にしても読み出し要求時の `--clock` の代わりにはならない。
+// スーパーマリオRPGのバンク$C0を安全段階で3回読むと、読み出しごとに明示指定した
+// 場合は相違0、起動時クロックだけの場合は1〜2バイト化けた。Nano-2はシリアルを
+// 開くたびリセットされるのでクロックも途切れる。sanniがSi5351(独立したIC)を
+// 使って回しっぱなしにしているのは、この構造的な差を避けるためでもある。
+const int8_t BOOT_CART_CLOCK_OCR = -1;
+
+// 検証用。true にすると起動時クロックを約30Hzまで落とす（テスターで平均電圧を読むため）。
+// 通常のダンプでは必ず false に戻すこと。
+const bool BOOT_CART_CLOCK_SLOW = false;
+
 // OLEDは休止中。D11をカートのクロック出力に明け渡した際、データ線をD13へ移したが、
 // D13にはNano基板上のLEDと抵抗がぶら下がっていて駆動が足りず表示できなくなった。
 // Nano-2に他の空きピンは無いため、進捗表示を諦めてD12/D13をCIC制御へ回す。
@@ -89,10 +107,19 @@ const uint8_t CIC_OK_PIN = A6;   // analogRead専用。digitalReadは使えな�
 const uint8_t CIC_PROBE_PIN = A7;
 
 // 16MHz / (2 * (1 + OCR2A)) = 出力周波数。7で1MHz、1で4MHz、0で8MHz。
-void startCartClock(uint8_t ocr) {
+// slow=true では1024分周を掛ける。16MHz/1024/(2*(1+OCR2A))。OCR2A=255で約30Hz。
+//
+// なぜ低速モードが要るのか: 「発振しているか」をテスターで確かめるため。
+// 50%デューティの方形波はDCモードで電源電圧の半分(2.5V)に見えるはずだが、
+// 4MHzでは実測1.75Vだった。テスターのDC帯域は普通数kHz程度しかないので、
+// この値は「発振していない」証拠にも「電圧不足」の証拠にもならない。
+// 30Hzまで落とせばどんなテスターでも正確に平均でき、2.5Vちょうどが出れば
+// 出力は健全（＝1.75Vは測定器側の帯域不足）と確定する。
+void startCartClock(uint8_t ocr, bool slow) {
   pinMode(CART_CLK_PIN, OUTPUT);
   TCCR2A = _BV(COM2A0) | _BV(WGM21); // CTCモード、比較一致でOC2Aをトグル
-  TCCR2B = _BV(CS20);                // 分周なし
+  TCCR2B = slow ? (_BV(CS22) | _BV(CS21) | _BV(CS20))  // 1024分周
+                : _BV(CS20);                            // 分周なし
   OCR2A = ocr;
 }
 
@@ -344,6 +371,21 @@ void setup() {
   pinMode(REFRESH_PIN, OUTPUT); digitalWrite(REFRESH_PIN, LOW);  // SA-1に必要
   setDataPinsInput();
 
+  // 起動直後からカートへクロックを出し続ける。
+  //
+  // 従来は「読み出しの要求が来たとき」にだけ startCartClock を呼んでいた。しかし
+  // Nano-3は電源投入の300ms後にCIC握手を実行するので、**握手の最中もリセット解除の
+  // 時点も、カート1番には一度もクロックが来ていなかった。** SA-1のようなバス調停
+  // チップが起動時点の状態をラッチするなら、後からクロックを与えても手遅れになる。
+  //
+  // 実測でも、読み出し中のクロック供給の有無は結果を1ビットも変えなかった
+  // (I-RAM窓0x34 / BW-RAM窓0xFF / ROM窓0x00 で完全に同一)。
+  // BOOT_CART_CLOCK_OCR を -1 にすれば従来の挙動に戻る。
+  if (BOOT_CART_CLOCK_OCR >= 0) {
+    startCartClock(BOOT_CART_CLOCK_SLOW ? 255 : (uint8_t)BOOT_CART_CLOCK_OCR,
+                   BOOT_CART_CLOCK_SLOW);
+  }
+
   oled.begin();
   const bool coldBoot = (bootMagic != BOOT_MAGIC);
   bootMagic = BOOT_MAGIC;
@@ -394,7 +436,7 @@ void setup() {
   // hdr[9] はクロックの分周値(OCR2A)。16MHz/(2*(1+n)) が出力周波数になる。
   //   n=7 -> 1MHz / n=3 -> 2MHz / n=2 -> 2.67MHz / n=1 -> 4MHz / n=0 -> 8MHz
   // CICの公称は3.072MHzだが16MHzからは整数分周で作れないので、近い値を掃引して探す。
-  if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9]);
+  if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9], false);
 
   const bool laMode = (hdr[8] & 0x10) != 0;
   if (laMode) {
