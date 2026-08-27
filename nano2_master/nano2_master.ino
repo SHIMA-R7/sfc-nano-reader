@@ -59,11 +59,53 @@ const uint8_t REFRESH_PIN = 13;
 // 場合は相違0、起動時クロックだけの場合は1〜2バイト化けた。Nano-2はシリアルを
 // 開くたびリセットされるのでクロックも途切れる。sanniがSi5351(独立したIC)を
 // 使って回しっぱなしにしているのは、この構造的な差を避けるためでもある。
+// 起動時からカートへ出すクロックの分周値。-1 で「読み出し時だけ」。
+// 16MHz/(2*(1+n)) が出力周波数。1=4MHz / 3=2MHz / 7=1MHz / 0=8MHz。
+//
+// **2026-08-28: 一度 1(4MHz常時) にして D11 -> カート56番 を試したが失敗した。**
+// 「実データ率1.00」と出たので窓が消えたと判断したが、**判定が誤っていた**。
+// 0x00 や 0x02 で埋まっていても「0xFFではない」ので1.00になる。
+// 実際には KIRBY の文字列がROM内のどこにも存在せず、中身は空だった。
+// Nano-3のD12が認証後に手放すのと同じ状態に戻す。
+//
+// **既定は -1（無効）。** Super FX ではカートへのクロックは有害で、与えた途端に
+// GSUが起きてバスを完全に奪う（README「カートへのクロック供給は Super FX には逆効果」）。
 const int8_t BOOT_CART_CLOCK_OCR = -1;
 
 // 検証用。true にすると起動時クロックを約30Hzまで落とす（テスターで平均電圧を読むため）。
 // 通常のダンプでは必ず false に戻すこと。
 const bool BOOT_CART_CLOCK_SLOW = false;
+
+// ■ sanniの起動シーケンスを再現する（2026-08-28）
+//
+// setup_Snes() を逐語で読み直したら、**周波数の解釈を間違えていた**。
+// Si5351の set_freq は 0.01Hz 単位（後段の 2147727200 = 21.47727MHz から確定）。
+// つまり起動時の設定は:
+//
+//     clockgen.set_freq(400000000ULL, SI5351_CLK0);  // マスター =  4.000MHz
+//     clockgen.set_freq(100000000ULL, SI5351_CLK2);  // CIC     =  1.000MHz
+//     clockgen.output_enable(SI5351_CLK1, 0);        // CPU     = 無効
+//     delay(500);
+//     PORTG &= ~(1 << 1);                            // CICリセット解除
+//     delay(500);
+//     getCartInfo_SNES();                            // ← ここでヘッダを読む
+//     // **その後で** 21.477MHz / 3.072MHz へ上げる
+//
+// **ヘッダが読めるまでは低い周波数で動かしている。**
+// こちらは最初から21.477MHzを流しっぱなしだった。順序が違う。
+//
+// 1MHzはNano-2のTimer2で誤差なく作れる: 16MHz/(2*(1+7)) = 1.000MHz (OCR2A=7)
+//
+// 0 にするとこの機能を使わない。
+const uint16_t BOOT_CLOCK_BURST_MS = 0;
+
+// CICクロック(カート56番)の分周値。7 = 1.000MHz（sanniの起動時と同じ）。
+// -1 で出さない。
+// -2 = D11を静的にLowで駆動 / -3 = 静的にHigh（配線が生きているかの確認用）
+const int8_t CIC_CLOCK_OCR = -2;
+// Nano-3が電源投入300ms後にCICリセットを打つ。sanniはリセット解除後500ms待つので、
+// それを覆う時間だけクロックを出し続けてから読み出しに入る。
+const uint16_t CIC_SETTLE_MS = 900;
 
 // OLEDは休止中。D11をカートのクロック出力に明け渡した際、データ線をD13へ移したが、
 // D13にはNano基板上のLEDと抵抗がぶら下がっていて駆動が足りず表示できなくなった。
@@ -154,6 +196,24 @@ void setDataPinsInput() {
 }
 
 // cart D0-D5 -> A0-A5 = PINC bit0-5 / cart D6-D7 -> D8-D9 = PINB bit0-1
+// ■ 制御線のポート直叩き（2026-08-27 高速化）
+// digitalWrite は1回**約4us**かかる。ピン番号からポートを引き、割り込みを止め、
+// PWMを無効化する処理が毎回走るため。1バイトあたり6回呼んでいたので24us、
+// tier1の実測77.7us/byteのうち3割がここだった。
+//
+// RD_PIN=2 / ROMSEL_PIN=3 / STROBE_PIN=4 はいずれも PORTD なので、
+// ビット操作1命令(約0.06us)で置き換えられる。70倍速くなる。
+//
+// なお Nano-1 は**既に直叩き化済み**だった。addrSettleUs のコメントにある
+// 「Nano-1側の16本分のdigitalWrite完了を待つマージン」は、直叩き化する前の
+// 古い記述が残っていたもの。実コードは writeAddr() で3命令しか使っていない。
+#define RD_HIGH()     (PORTD |= _BV(PD2))
+#define RD_LOW()      (PORTD &= ~_BV(PD2))
+#define ROMSEL_HIGH() (PORTD |= _BV(PD3))
+#define ROMSEL_LOW()  (PORTD &= ~_BV(PD3))
+#define STROBE_HIGH() (PORTD |= _BV(PD4))
+#define STROBE_LOW()  (PORTD &= ~_BV(PD4))
+
 static inline uint8_t readDataBus() {
   return (uint8_t)((PINC & 0x3F) | ((PINB & 0x03) << 6));
 }
@@ -166,10 +226,15 @@ void resetNano1Addr() {
 }
 
 void pulseStrobe() {
-  digitalWrite(STROBE_PIN, HIGH);
-  delayMicroseconds(pulseUs);
-  digitalWrite(STROBE_PIN, LOW);
-  delayMicroseconds(addrSettleUs); // Nano-1側の16本分のdigitalWrite完了を待つマージン
+  STROBE_HIGH();
+  if (pulseUs) delayMicroseconds(pulseUs);
+  STROBE_LOW();
+  // Nano-1がPCINT割り込みでアドレスを更新し終えるのを待つ。
+  // Nano-1側は既に直叩き(writeAddrは3命令)なので、必要なのは
+  // 「割り込みが起動してISRが走り終わる」時間だけ。従来の20usは過剰の疑いがある。
+  // ただし削りすぎるとアドレスがずれたまま読むので、正解の分かっている
+  // カートで実測して決めること。
+  if (addrSettleUs) delayMicroseconds(addrSettleUs);
 }
 
 void resetNano3Bank() {
@@ -231,12 +296,14 @@ void splashScreen() {
 bool sramMode = false;
 
 uint8_t readByte() {
-  if (!sramMode) digitalWrite(ROMSEL_PIN, LOW);
-  digitalWrite(RD_PIN, LOW);
-  delayMicroseconds(rdSettleUs); // 長い配線の寄生容量を考慮して大きめに確保
+  if (!sramMode) ROMSEL_LOW();
+  RD_LOW();
+  // delayMicroseconds(0) はArduinoの実装でループカウンタがアンダーフローし、
+  // 極端に長く待つ既知の罠がある。0のときは呼ばない。
+  if (rdSettleUs) delayMicroseconds(rdSettleUs);
   uint8_t v = readDataBus();
-  digitalWrite(RD_PIN, HIGH);
-  if (!sramMode) digitalWrite(ROMSEL_PIN, HIGH);
+  RD_HIGH();
+  if (!sramMode) ROMSEL_HIGH();
   return v;
 }
 
@@ -384,6 +451,27 @@ void setup() {
   if (BOOT_CART_CLOCK_OCR >= 0) {
     startCartClock(BOOT_CART_CLOCK_SLOW ? 255 : (uint8_t)BOOT_CART_CLOCK_OCR,
                    BOOT_CART_CLOCK_SLOW);
+  } else if (CIC_CLOCK_OCR == -2 || CIC_CLOCK_OCR == -3) {
+    // 配線の生死を確かめるための静的駆動。クロックではなく直流を出す。
+    // これで応答が変われば D11 -> カート56番 は繋がっている。
+    DDRB |= _BV(PB3);
+    if (CIC_CLOCK_OCR == -3) PORTB |= _BV(PB3); else PORTB &= (uint8_t)~_BV(PB3);
+  } else if (CIC_CLOCK_OCR >= 0) {
+    // sanniの起動シーケンス相当。CICクロックを1MHzで出し、
+    // Nano-3のリセット(300ms後)とその後の落ち着きを待つ。
+    // **クロックは止めない。** sanniは CLK2 を立てたきり切らない。
+    startCartClock((uint8_t)CIC_CLOCK_OCR, false);
+    delay(CIC_SETTLE_MS);
+  } else if (BOOT_CLOCK_BURST_MS > 0) {
+    // D12の再現。一定時間クロックを出してから手放す。
+    startCartClock(1, false);          // 4.000MHz
+    delay(BOOT_CLOCK_BURST_MS);
+    // タイマー出力を切り離し、ピンを入力に戻す（＝浮かせる）。
+    // D12が DDRB &= ~CLK_BIT でやっていたのと同じ状態にする。
+    TCCR2A = 0;
+    TCCR2B = 0;
+    PORTB &= (uint8_t)~_BV(PB3);       // D11 = PB3。プルアップを付けない
+    DDRB  &= (uint8_t)~_BV(PB3);       // 入力へ戻す
   }
 
   oled.begin();
@@ -420,10 +508,18 @@ void setup() {
   // 受信準備ができたことを 'R' で知らせてから待つ（先に送られると取りこぼすため）。
   oled.drawString(0, 2, "waiting bank..");
   Serial.write('R');
-  uint8_t hdr[10];
+  // 11バイト目は「続けて読むバンク数」(連続バンクモード)。
+  // 旧ホストは10バイトしか送らないので、11バイト目は短いタイムアウト付きで待ち、
+  // 来なければ0(=1バンクで停止、従来動作)とみなす。こうしないと旧ホストが固まる。
+  uint8_t hdr[11] = {0};
   for (uint8_t i = 0; i < 10; i++) {
     while (Serial.available() == 0) { /* 待機 */ }
     hdr[i] = (uint8_t)Serial.read();
+  }
+  {
+    const uint32_t deadline = millis() + 50;
+    while (Serial.available() == 0 && millis() < deadline) { /* 待機 */ }
+    if (Serial.available() > 0) hdr[10] = (uint8_t)Serial.read();
   }
   uint8_t target = hdr[0];
   uint8_t totalBanks = hdr[1];
@@ -495,17 +591,39 @@ void setup() {
   resetNano3Bank();
   for (uint16_t b = 0; b < target; b++) pulseBankStrobe(); // 目的のバンクまで進める
 
-  char prog[17];
-  for (uint32_t a = 0; a < BANK_SIZE; a++) {
-    uint8_t v = readByte();
-    Serial.write(v);
-    pulseStrobe(); // 読んだ直後に次のアドレスへ進める
+  // 連続バンクモード: hdr[10] に「このセッションで続けて読むバンク数」が入る。
+  // 0または1なら従来どおり1バンクで停止する。
+  //
+  // ■ なぜ必要か
+  // 従来はPCがシリアルを開くたびDTRでNano-2がリセットされ、1バンクごとに
+  // 起動処理をやり直していた。バンクあたり約2秒の固定費で、64バンクなら2分強を
+  // 捨てていた。通常のROMなら気にならないが、**SA-1は時間とともに提示する内容を
+  // 変えてしまう**（実測: 同じバンクを54秒間読み続けると2つの状態を行き来する）。
+  // 読み切るまでの時間そのものが正しさに直結するので、ここを削る。
+  //
+  // sanniは1バイトあたり375ns(アドレス設定+6NOP)で読む。このリグは約7000ns。
+  // 1バイトの差は埋められないが、バンクあたりの固定費は消せる。
+  const uint8_t runBanks = (hdr[10] == 0) ? 1 : hdr[10];
 
-    // OLED更新は1回数msかかるので毎バイトはやらない（47us/byteの律速を壊す）。
-    // 8192バイトごと(1バンクあたり8回)なら誤差程度。
-    if ((a & 0x1FFF) == 0) {
-      snprintf(prog, sizeof(prog), "%5lu/%5lu", (unsigned long)(a + 1), (unsigned long)BANK_SIZE);
-      oled.drawString(0, 4, prog);
+  char prog[17];
+  for (uint8_t bank = 0; bank < runBanks; bank++) {
+    if (bank > 0) {
+      // 次のバンクへ。アドレスカウンタだけ0に戻し、バンクは+1する。
+      // ここでNano-2自身はリセットしない（それが節約の本体）。
+      resetNano1Addr();
+      pulseBankStrobe();
+    }
+    for (uint32_t a = 0; a < BANK_SIZE; a++) {
+      uint8_t v = readByte();
+      Serial.write(v);
+      pulseStrobe(); // 読んだ直後に次のアドレスへ進める
+
+      // OLED更新は1回数msかかるので毎バイトはやらない（47us/byteの律速を壊す）。
+      // 8192バイトごと(1バンクあたり8回)なら誤差程度。
+      if ((a & 0x1FFF) == 0) {
+        snprintf(prog, sizeof(prog), "%5lu/%5lu", (unsigned long)(a + 1), (unsigned long)BANK_SIZE);
+        oled.drawString(0, 4, prog);
+      }
     }
   }
   snprintf(prog, sizeof(prog), "%5lu/%5lu", (unsigned long)BANK_SIZE, (unsigned long)BANK_SIZE);
