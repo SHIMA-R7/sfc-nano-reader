@@ -39,3 +39,6 @@ build/
 *.spec
 exe_test*.png
 yakouchuu_screenshot.png
+
+# 実験中のホスト側ログ（成果物ではない）
+host/*.log
