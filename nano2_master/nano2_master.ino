@@ -102,7 +102,10 @@ const uint16_t BOOT_CLOCK_BURST_MS = 0;
 // CICクロック(カート56番)の分周値。7 = 1.000MHz（sanniの起動時と同じ）。
 // -1 で出さない。
 // -2 = D11を静的にLowで駆動 / -3 = 静的にHigh（配線が生きているかの確認用）
-const int8_t CIC_CLOCK_OCR = -2;
+// **CICクロックは21.4MHzduinoが出すようになったので、-1(出さない)にする。**
+// D11はカート56番から外れた。ここから出しても行き先が無い。
+// 出力の衝突を避けるためにも無効のままにしておくこと。
+const int8_t CIC_CLOCK_OCR = -1;
 // Nano-3が電源投入300ms後にCICリセットを打つ。sanniはリセット解除後500ms待つので、
 // それを覆う時間だけクロックを出し続けてから読み出しに入る。
 const uint16_t CIC_SETTLE_MS = 900;
@@ -295,7 +298,36 @@ void splashScreen() {
 // 物理的に起こらない。救出対象のセーブデータを壊す事故は原理的に発生しない。
 bool sramMode = false;
 
+// ■ sanni方式: /RD と /ROMSEL を Low に固定したまま読む（2026-08-28）
+//
+// sanni の setup_Snes() は起動時に一度だけ落として、以後**一切動かさない**:
+//
+//     PORTH &= ~((1 << 3) | (1 << 6));   // /CS と /RD を LOW
+//
+// そして readBank_SNES() は「アドレスを置く → 6NOP待つ → PINCを読む」だけ。
+// **制御線をバイトごとに触らない。**
+//
+// こちらは1バイトごとに /ROMSEL と /RD を Low→High と往復させていた。
+// 64KBなら65536回。SA-1は**バス調停チップ**なので、制御線が動くたびに
+// 「SNES側が新しいバスサイクルを始めた」という信号になり、
+// **そのたびに調停の機会を与えている**ことになる。
+//
+// 「バンクの途中で力尽きる」「数秒で閉じる」という実測は、
+// この往復のどこかでSA-1にバスを奪われていると考えると筋が通る。
+//
+// HOLD_STROBES_LOW = 1 でsanni方式（固定）、0 で従来方式（往復）。
+//
+// **注意**: /RD をLow固定にするとROMが常時データを出し続ける。
+// アドレス変更中も出力されるので、配線によってはバス競合や消費電流増が起きうる。
+// sanniのMega構成では問題ないが、この配線で同じとは限らない。
+#define HOLD_STROBES_LOW 0
+
 uint8_t readByte() {
+#if HOLD_STROBES_LOW
+  // 制御線はsetup()でLowにしたまま。ここでは触らない。
+  if (rdSettleUs) delayMicroseconds(rdSettleUs);
+  return readDataBus();
+#else
   if (!sramMode) ROMSEL_LOW();
   RD_LOW();
   // delayMicroseconds(0) はArduinoの実装でループカウンタがアンダーフローし、
@@ -305,6 +337,7 @@ uint8_t readByte() {
   RD_HIGH();
   if (!sramMode) ROMSEL_HIGH();
   return v;
+#endif
 }
 
 // CICを起動して認証の成立を待つ。戻り値は成立したかどうか。
@@ -429,8 +462,14 @@ void setup() {
   digitalWrite(CART_RESET_PIN, HIGH);
   pinMode(CART_RESET_PIN, OUTPUT);
 
+#if HOLD_STROBES_LOW
+  // sanni方式。起動時にLowへ落として以後動かさない。
+  pinMode(RD_PIN, OUTPUT); digitalWrite(RD_PIN, LOW);
+  pinMode(ROMSEL_PIN, OUTPUT); digitalWrite(ROMSEL_PIN, LOW);
+#else
   pinMode(RD_PIN, OUTPUT); digitalWrite(RD_PIN, HIGH);
   pinMode(ROMSEL_PIN, OUTPUT); digitalWrite(ROMSEL_PIN, HIGH);
+#endif
   pinMode(STROBE_PIN, OUTPUT); digitalWrite(STROBE_PIN, LOW);
   pinMode(BANK_RESET_PIN, OUTPUT); digitalWrite(BANK_RESET_PIN, LOW);
   pinMode(BANK_STROBE_PIN, OUTPUT); digitalWrite(BANK_STROBE_PIN, LOW);
