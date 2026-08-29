@@ -39,3 +39,9 @@ build/
 *.spec
 exe_test*.png
 yakouchuu_screenshot.png
+
+# 実験中のホスト側ログ（成果物ではない）
+host/*.log
+
+# 初期の短い製作記。SA-1攻略前の内容で現在の記述と矛盾するため外す
+docs/製作記.pdf

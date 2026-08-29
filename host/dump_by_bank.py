@@ -31,6 +31,10 @@ def parse_args():
                         "(スーパーマリオカート等)は 0xC0 を指定する。"
                         "$00-$3F の $6000-$7FFF はDSP-1に乗っ取られていてROMが読めないが、"
                         "$C0 以降のミラーにはDSP-1が居ないため")
+    p.add_argument("--clock", action="store_true",
+                   help="カートへクロックを供給しながら読む。SA-1カート(スーパーマリオRPG等)に必要")
+    p.add_argument("--clock-ocr", type=int, default=1,
+                   help="クロックの分周値。16MHz/(2*(1+n))。1=4MHz(既定) 0=8MHz 7=1MHz")
     a = p.parse_args()
     a.start_bank = int(str(a.start_bank), 0)
     return a
@@ -87,7 +91,8 @@ def main():
         bank_start = time.time()
         data, tier_idx, tier = read_bank_confirmed(
             args.port, b, total_banks=args.banks, start_idx=adaptive.next_start_idx(),
-            log=lambda m: print(m, flush=True))
+            log=lambda m: print(m, flush=True),
+            cart_clock=args.clock, clock_ocr=args.clock_ocr)
         if data is None:
             print(f"bank {b:3d}: 一致を得られませんでした。中断します。", flush=True)
             return 1

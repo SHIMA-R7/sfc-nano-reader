@@ -7,6 +7,7 @@ GUIだけで操作するためのアプリ。ブラウザ不要、Python標準�
     python sfc_dumper_gui.py
 """
 
+import glob
 import os
 import queue
 import subprocess
@@ -34,6 +35,22 @@ if _HOST_DIR not in sys.path:
     sys.path.insert(0, _HOST_DIR)
 from bankio import (BANK_SIZE, TIMING_TIERS, AdaptiveTiming,  # noqa: E402
                     read_bank_confirmed, _read_bank_once)
+
+# 多数決マージは numpy を使う。入っていない環境でもGUI自体は動くべきなので、
+# 読み込めなければ「多数決」方式だけを無効化して、他の機能はそのまま使えるようにする。
+try:
+    from contact_merge import (candidate_sizes, merge_samples,  # noqa: E402
+                               rom_sum, slice_for, title_of)
+    VOTE_AVAILABLE = True
+except Exception as _e:  # numpy が無い等
+    VOTE_IMPORT_ERROR = str(_e)
+    VOTE_AVAILABLE = False
+
+    def rom_sum(data):
+        return sum(data)
+
+    def candidate_sizes(length):
+        return [length]
 
 DEFAULT_BAUD = 1000000
 
@@ -135,12 +152,21 @@ def detect_mapping(raw_bank0):
 
 
 def verify_checksum(rom, mapping):
+    """チェックサムを検証する。戻り値は (一致したか, 計算値, 期待値, 実体のサイズ)。
+
+    ヘッダのROMサイズ申告は2の累乗に切り上げられているので、読んだ長さがそのまま実体とは
+    限らない。ドラゴンクエストI・IIは2MBと名乗るが実体は12Mbit(1.5MB)で、後半4Mbitは
+    アドレス空間に2回現れる。全体で合わなければ短いサイズも試し、合った時点でそこまでを
+    実体とみなす（末尾はミラーなので切り落とす）。
+    """
     off = 0xFFC0 if mapping == "hirom" else 0x7FC0
     hdr = read_header(rom, off)
     if not hdr:
-        return False, None, None
-    computed = sum(rom) & 0xFFFF
-    return computed == hdr["checksum"], computed, hdr["checksum"]
+        return False, None, None, len(rom)
+    for size in candidate_sizes(len(rom)):
+        if size >= off + 32 and rom_sum(rom[:size]) & 0xFFFF == hdr["checksum"]:
+            return True, hdr["checksum"], hdr["checksum"], size
+    return False, rom_sum(rom) & 0xFFFF, hdr["checksum"], len(rom)
 
 
 def majority_merge(samples):
@@ -263,12 +289,37 @@ class DumperApp(tk.Tk):
         ttk.Entry(dump, textvariable=self.out_var, width=58).grid(row=2, column=1, columnspan=3, sticky="w")
         ttk.Button(dump, text="参照...", command=self.choose_output).grid(row=2, column=4, padx=6)
 
-        self.repeat_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(dump, text="各バンクを2回読んで一致するまで繰り返す（推奨）",
-                        variable=self.repeat_var).grid(row=3, column=0, columnspan=4, sticky="w", padx=6, pady=4)
+        ttk.Label(dump, text="方式:").grid(row=3, column=0, sticky="w", padx=6, pady=4)
+        self.method_var = tk.StringVar(value="confirm")
+        method_row = ttk.Frame(dump)
+        method_row.grid(row=3, column=1, columnspan=4, sticky="w")
+        ttk.Radiobutton(method_row, text="2回読んで一致するまで繰り返す（推奨・速い）",
+                        value="confirm", variable=self.method_var,
+                        command=self._on_method_change).pack(side="left")
+        self.vote_radio = ttk.Radiobutton(
+            method_row, text="多数決マージ（何度読んでも一致しないカート）",
+            value="vote", variable=self.method_var, command=self._on_method_change)
+        self.vote_radio.pack(side="left", padx=10)
+        if not VOTE_AVAILABLE:
+            self.vote_radio.config(state="disabled")
+
+        self.vote_frame = ttk.Frame(dump)
+        self.vote_frame.grid(row=4, column=0, columnspan=5, sticky="w", padx=22, pady=2)
+        ttk.Label(self.vote_frame, text="1バンクあたりのサンプル数:").pack(side="left")
+        self.samples_var = tk.StringVar(value="5")
+        ttk.Spinbox(self.vote_frame, from_=3, to=40, width=4,
+                    textvariable=self.samples_var).pack(side="left", padx=4)
+        ttk.Label(self.vote_frame, text="タイミング:").pack(side="left", padx=(10, 0))
+        self.tier_var = tk.StringVar(value="自動巡回")
+        ttk.Combobox(self.vote_frame, textvariable=self.tier_var, state="readonly", width=12,
+                     values=["自動巡回"] + [t[3] for t in TIMING_TIERS]
+                     ).pack(side="left", padx=4)
+        self.sweep_btn = ttk.Button(self.vote_frame, text="タイミングを掃引して決める",
+                                    command=self.start_sweep)
+        self.sweep_btn.pack(side="left", padx=8)
 
         btns = ttk.Frame(dump)
-        btns.grid(row=4, column=0, columnspan=5, sticky="w", padx=6, pady=6)
+        btns.grid(row=5, column=0, columnspan=5, sticky="w", padx=6, pady=6)
         self.identify_btn = ttk.Button(btns, text="カートを判定 (1バンクだけ読む)", command=self.start_identify)
         self.identify_btn.pack(side="left")
         self.dump_btn = ttk.Button(btns, text="ダンプ開始", command=self.start_dump)
@@ -309,6 +360,11 @@ class DumperApp(tk.Tk):
         sb = ttk.Scrollbar(logf, command=self.log_text.yview)
         sb.pack(fill="y", side="right")
         self.log_text.config(yscrollcommand=sb.set)
+
+        self._on_method_change()
+        if not VOTE_AVAILABLE:
+            self.log(f"多数決マージは使えません（numpy が読み込めません: {VOTE_IMPORT_ERROR}）。"
+                     "pip install numpy で有効になります。")
 
     # -- ヘルパ ---------------------------------------------------
 
@@ -416,6 +472,19 @@ class DumperApp(tk.Tk):
         self.dump_btn.config(state=state)
         self.sram_btn.config(state=state)
         self.cancel_btn.config(state="normal" if busy else "disabled")
+        if busy:
+            self.sweep_btn.config(state="disabled")
+        else:
+            self._on_method_change()
+
+    def _on_method_change(self):
+        """多数決方式のときだけ、その設定欄を触れるようにする。"""
+        state = "normal" if self.method_var.get() == "vote" else "disabled"
+        for w in self.vote_frame.winfo_children():
+            try:
+                w.config(state=state)
+            except tk.TclError:
+                pass
 
     def cancel(self):
         self.cancel_flag.set()
@@ -667,6 +736,16 @@ class DumperApp(tk.Tk):
         if not out:
             messagebox.showerror("出力先未設定", "出力ファイルを指定してください。")
             return
+        if self.method_var.get() == "vote":
+            try:
+                samples = int(self.samples_var.get())
+                if samples < 3:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("入力エラー", "サンプル数は3以上で指定してください。")
+                return
+            self.run_worker(lambda: self._dump_vote(port, banks, mapping, out, samples))
+            return
         self.run_worker(lambda: self._dump(port, banks, mapping, out))
 
     def _dump(self, port, banks, mapping, out, start_bank=0):
@@ -722,7 +801,12 @@ class DumperApp(tk.Tk):
         dump_elapsed = time.time() - dump_start
 
         rom = extract_rom(b"".join(collected), mapping)
-        ok, computed, expected = verify_checksum(rom, mapping)
+        ok, computed, expected, size = verify_checksum(rom, mapping)
+        if ok and size != len(rom):
+            self.log(f"実体は {size} bytes ({size // 1024}KB) でした。"
+                     f"末尾 {len(rom) - size} bytes はミラーなので切り落とします。")
+            self.log("  （ヘッダのROMサイズ申告は2の累乗に切り上げられています）")
+            rom = rom[:size]
         crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
 
         self.log(f"合計 {len(rom)} bytes")
@@ -764,6 +848,349 @@ class DumperApp(tk.Tk):
         else:
             self.after(0, lambda: messagebox.showwarning(
                 "チェックサム不一致", f"検証を通らなかったため .unverified で保存しました。\n{final}"))
+
+
+    # -- タイミング掃引 ---------------------------------------------
+
+    def start_sweep(self):
+        port = self.selected_port()
+        if not port:
+            messagebox.showerror("ポート未選択", "シリアルポートを選んでください。")
+            return
+        mapping = self.mapping_var.get()
+        if mapping == "auto":
+            messagebox.showerror("マッピング未確定",
+                                 "「カートを判定」を実行するか、LoROM/HiROMを選んでください。")
+            return
+        self.run_worker(lambda: self._sweep(port, mapping))
+
+    def _sweep(self, port, mapping, bank=0):
+        """同じバンクを各段階で2回ずつ読み、相違と0xFF率を並べる。
+
+        「読むたび内容が変わる」は電源・接触・マッパー・タイミング不足のどれでも起きる。
+        この掃引はそれを切り分けるためにある。読み方は3通りに分かれる:
+
+          ・段階を遅くすると相違が単調に減る → **タイミングマージン不足**。
+            遅い段階で読めば済む。票を積むのは時間の無駄
+          ・遅くしても相違が変わらず、0xFF率が読むたび動く → **接触**。
+            挿し直しが最優先。それでも駄目なら多数決
+          ・遅くすると**悪化する** → Super FX。相手がバスを持っているので最速のまま
+            回数で殴る（段階は「高速」に固定する）
+
+        0xFF率が全段階で動かないなら、その0xFFは本物のデータであって読み落としではない。
+        """
+        half = BANK_SIZE // 2
+        self.log(f"タイミング掃引を開始します（bank {bank} を各段階で2回ずつ）。"
+                 f"3分ほどかかります。")
+        rows = []
+        for idx, tier in enumerate(TIMING_TIERS):
+            reads = []
+            for _ in range(2):
+                if self.cancel_flag.is_set():
+                    return
+                self.status_var.set(f"掃引 [{tier[3]}]")
+                d = _read_bank_once(port, bank, tier, cancel_flag=self.cancel_flag,
+                                    log=self.log)
+                if d is None:
+                    break
+                reads.append(d[half:] if mapping == "lorom" else d)
+            if len(reads) != 2:
+                self.log(f"  [{tier[3]:6s}] 読み出しに失敗しました")
+                continue
+            diff = sum(1 for a, b in zip(*reads) if a != b)
+            ff = [r.count(0xFF) / len(r) for r in reads]
+            rows.append((idx, tier, diff, ff))
+            self.log(f"  [{tier[3]:6s}] 相違 {diff:6d}/{len(reads[0])}  "
+                     f"0xFF率 {ff[0]:.4f}/{ff[1]:.4f}")
+
+        if not rows:
+            self.log("掃引できませんでした。配線とポートを確認してください。")
+            return
+
+        # まず段階に対する傾向を見る。0xFF率の揺れは「相違が段階に反応しない」ときの
+        # 決め手として使う。Super FX でも0xFF率は動く（GSUがバスを握った読みが0xFFになる）
+        # ので、揺れだけで接触と決めつけると誤診する。
+        allff = [v for _, _, _, ff in rows for v in ff]
+        ff_swing = max(allff) - min(allff)
+        diffs = [d for _, _, d, _ in rows]
+        trend = _trend(diffs)
+
+        clean = [r for r in rows if r[2] == 0]
+        good = [r for r in rows if r[2] <= 8]
+        if not any(diffs):
+            self.log("→ どの段階でも相違0でした。このカートは素直に読めます。")
+        elif trend == "down":
+            self.log("→ 遅くすると相違が減っています。タイミングマージン不足です。"
+                     "遅い段階で読めば済むので、票を積む必要はありません。")
+            if ff_swing <= 0.01:
+                self.log(f"  0xFF率は {min(allff):.4f}〜{max(allff):.4f} でほぼ動きません。"
+                         "この0xFFは本物のデータで、読み落としではありません。")
+        elif trend == "up":
+            self.log("→ 遅くすると悪化しています。Super FX のようにカート側がバスを"
+                     "持っている可能性があります。段階は「高速」のまま、"
+                     "回数（サンプル数）で殴ってください。")
+        elif ff_swing > 0.01:
+            self.log(f"→ 段階を変えても相違が減らず、0xFF率が {ff_swing:.3f} 揺れています。"
+                     "接触です。まずカートを挿し直すのが最短で、"
+                     "それで駄目なら多数決マージに進んでください。")
+        else:
+            self.log("→ 段階を変えても改善せず、0xFF率も動きません。"
+                     "電源やNano間の配線を疑ってください。")
+
+        pick = (clean or good or rows)[0]
+        self.tier_var.set(pick[1][3])
+        self.log(f"タイミングを [{pick[1][3]}] に設定しました（相違 {pick[2]}）。")
+        if pick[2] == 0:
+            self.log("  この段階なら2回一致が取れるので、方式は「2回読んで一致」で足ります。")
+        else:
+            self.log("  相違が残るので、多数決マージで押し切るのが確実です。")
+
+    # -- 多数決マージ方式 -------------------------------------------
+
+    def _vote_tier_index(self, sample_idx, bump=0):
+        """このサンプルをどの段階で読むかを決める。
+
+        「自動巡回」は1本ごとに段階を変える。同じ条件で読み続けると同じ場所が同じように
+        化けやすく、票が割れないまま間違いが多数派に居座るため。
+        bump は追加取得のたびに1段ずつ遅くするための下駄。
+        """
+        label = self.tier_var.get()
+        if label == "自動巡回":
+            return (sample_idx + bump) % len(TIMING_TIERS)
+        labels = [t[3] for t in TIMING_TIERS]
+        base = labels.index(label) if label in labels else 0
+        return min(base + bump, len(TIMING_TIERS) - 1)
+
+    def _read_vote_sample(self, port, bank, cache, mapping, total_banks, bump, label,
+                          save=True):
+        """1本だけ読んでキャッシュに保存する。票にできなければ None。
+
+        save=False はカートの照合用。まだ「同じカートか」が分かっていない読みを
+        キャッシュに書くと、取り違えを検出して中断しても別カートのサンプルがファイルとして
+        残り、次回それが票として読み込まれてしまう。
+        """
+        idx = len(glob.glob(os.path.join(cache, f"bank_{bank:03d}_s*.bin")))
+        tier = TIMING_TIERS[self._vote_tier_index(idx, bump)]
+        self.status_var.set(label)
+        data = _read_bank_once(port, bank, tier, total_banks=total_banks,
+                               cancel_flag=self.cancel_flag, log=self.log)
+        if data is None:
+            if not self.cancel_flag.is_set():
+                self.log(f"    [{tier[3]}] 読み出し失敗")
+            return None
+        if all(b == data[0] for b in data):
+            # 0xFF一色の読みは安定していて「2回一致」を平気で通す。票に入れると
+            # 本物より多数派になりうるので、ここで捨てる。
+            self.log(f"    [{tier[3]}] 全バイトが 0x{data[0]:02x}。カートが浮いています。破棄")
+            return None
+        if save:
+            with open(os.path.join(cache, f"bank_{bank:03d}_s{idx:02d}.bin"), "wb") as f:
+                f.write(data)
+        return slice_for(data, mapping)
+
+    def _dump_vote(self, port, banks, mapping, out, samples):
+        """同じバンクを何度も読み、バイトごとの多数決で確定させる。
+
+        2回一致方式が通らないカート用。生サンプルは <出力名>.votes/ に1本ずつ残るので、
+        中断しても、あとからサンプル数を増やしても、不足分だけ読み足せる。
+
+        サンプルは「バンクを一周しながら1本ずつ」集める。同じバンクを連続で読むと、
+        その全部が「接触が悪い数分」に入りうるため（実測で品質が数分の間に12倍動いた）。
+        """
+        cache = out + ".votes"
+        os.makedirs(cache, exist_ok=True)
+        chunk = BANK_SIZE // 2 if mapping == "lorom" else BANK_SIZE
+        self.log(f"多数決マージでダンプします（{mapping.upper()} / {banks}バンク / "
+                 f"1バンクあたり{samples}本 / タイミング: {self.tier_var.get()}）")
+        self.log(f"キャッシュ: {cache}")
+
+        order = list(range(banks))
+        pools = {}
+        for b in order:
+            got = []
+            for f in sorted(glob.glob(os.path.join(cache, f"bank_{b:03d}_s*.bin"))):
+                if os.path.getsize(f) == BANK_SIZE:
+                    with open(f, "rb") as fh:
+                        got.append(slice_for(fh.read(), mapping))
+            pools[b] = got
+
+        have = sum(len(v) for v in pools.values())
+        if have:
+            cached_title = next((t for t in (title_of(s) for s in pools[0]) if t), None)
+            self.log(f"既存のサンプル {have} 本を再利用します"
+                     f"（キャッシュのカート: {cached_title or 'ヘッダを読めず不明'}）")
+            # キャッシュが信頼しているのは出力ファイル名だけで、カートの同一性は誰も
+            # 見ていない。差し替えて同じ名前で走らせると別のゲームが黙って混ざる。
+            probe = self._read_vote_sample(port, 0, cache, mapping, banks, 0,
+                                           "カート照合中", save=False)
+            if self.cancel_flag.is_set():
+                return
+            if probe is not None:
+                now = title_of(probe)
+                if cached_title and now and now != cached_title:
+                    msg = (f"キャッシュのカートは「{cached_title}」ですが、"
+                           f"今挿さっているのは「{now}」です。\n\n"
+                           f"混ぜると壊れたROMができます。\n{cache} を削除するか、"
+                           f"出力ファイル名を変えてください。")
+                    self.log(msg.replace("\n\n", " ").replace("\n", " "))
+                    self.after(0, lambda: messagebox.showerror("カートが違います", msg))
+                    return
+                pools[0].append(probe)
+                if now:
+                    self.log(f"  照合OK: {now}")
+
+        dump_start = time.time()
+        total_reads = banks * samples
+        self.after(0, lambda: self.progress.config(maximum=total_reads, value=have))
+
+        # --- 目標本数まで、バンクを一周しながら1本ずつ集める -------------------
+        for rnd in range(samples):
+            todo = [b for b in order if len(pools[b]) <= rnd]
+            if not todo:
+                continue
+            self.log(f"── {rnd + 1}周目（{len(todo)}バンク）")
+            for b in todo:
+                if self.cancel_flag.is_set():
+                    self.log("中止しました。読んだサンプルはキャッシュに残っています。")
+                    return
+                data = self._read_vote_sample(
+                    port, b, cache, mapping, banks, 0,
+                    f"bank {b}／{rnd + 1}周目")
+                if data is not None:
+                    pools[b].append(data)
+                done = sum(len(v) for v in pools.values())
+                self.after(0, lambda v=done: self.progress.config(value=v))
+
+        empty = [b for b in order if not pools[b]]
+        if empty:
+            self.log(f"サンプルが1本も無いバンクがあります: "
+                     f"{', '.join('$%02X' % b for b in empty)}")
+            self.after(0, lambda: messagebox.showerror(
+                "読み出し失敗", "1本も読めなかったバンクがあります。配線を確認してください。"))
+            return
+
+        results = {}
+        pending = []
+        for b in order:
+            data, share, unresolved, info = merge_samples(_stack(pools[b]))
+            results[b] = (data, unresolved)
+            self.log(f"bank ${b:02X}: {len(pools[b])}本 → 未決着 {unresolved.size} バイト"
+                     f" / 窓の除外 {info['excluded_windows']}/{info['total_windows']}"
+                     + (f" / ビット再構成 {info['bit_rebuilt']}"
+                        if "bit_rebuilt" in info else ""))
+            if unresolved.size:
+                pending.append(b)
+
+        # --- 決着していないバンクにだけ、段階を上げながら票を足す ---------------
+        # 票を増やしても駄目なら微秒を払う。原因が接触なら遅くしても変わらないが、
+        # タイミング不足なら劇的に減る。どちらかは事前に分からないので両方に賭ける。
+        fails = {b: 0 for b in order}
+        bump = 0
+        max_samples = max(samples * 3, 15)
+        while pending and not self.cancel_flag.is_set():
+            pending = [b for b in pending if len(pools[b]) < max_samples]
+            if not pending:
+                break
+            bump += 1
+            if self.tier_var.get() == "自動巡回":
+                note = "／ 段階を巡回しながら読みます"
+            else:
+                note = (f"／ タイミングを "
+                        f"[{TIMING_TIERS[self._vote_tier_index(0, bump)][3]}] に上げます")
+            self.log(f"── 追加取得: 未決着の残る {len(pending)} バンク {note}")
+            still = []
+            for b in pending:
+                if self.cancel_flag.is_set():
+                    return
+                data = self._read_vote_sample(port, b, cache, mapping, banks, bump,
+                                              f"bank {b} 追加取得")
+                if data is None:
+                    fails[b] += 1
+                    if fails[b] >= 3:
+                        self.log(f"bank ${b:02X}: 3回続けて読めませんでした。打ち切ります"
+                                 f"（未決着 {results[b][1].size} バイトが残ります）")
+                    else:
+                        still.append(b)
+                    continue
+                fails[b] = 0
+                pools[b].append(data)
+                merged, share, unresolved, info = merge_samples(_stack(pools[b]))
+                results[b] = (merged, unresolved)
+                self.log(f"bank ${b:02X}: {len(pools[b])}本 → 未決着 "
+                         f"{unresolved.size} バイト")
+                if unresolved.size:
+                    still.append(b)
+            pending = still
+
+        if self.cancel_flag.is_set():
+            self.log("中止しました。読んだサンプルはキャッシュに残っています。")
+            return
+
+        rom = b"".join(results[b][0] for b in order)
+        total_unresolved = sum(int(results[b][1].size) for b in order)
+        elapsed = time.time() - dump_start
+
+        ok, computed, expected, size = verify_checksum(rom, mapping)
+        if ok and size != len(rom):
+            self.log(f"実体は {size} bytes ({size // 1024}KB) でした。"
+                     f"末尾 {len(rom) - size} bytes はミラーなので切り落とします。")
+            rom = rom[:size]
+        crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
+
+        self.log(f"合計 {len(rom)} bytes / 未決着 {total_unresolved} バイト")
+        self.log(f"  チェックサム 計算値="
+                 f"{('0x%04x' % computed) if computed is not None else 'NA'} 期待値="
+                 f"{('0x%04x' % expected) if expected is not None else 'NA'} → "
+                 f"{'一致' if ok else '不一致'}")
+        self.log(f"  CRC32 = {crc}")
+        self.log(f"  所要時間 = {elapsed:.0f}秒")
+
+        matched = None
+        for e in self.db_entries or []:
+            c = e.get("crc")
+            if isinstance(c, bytes) and binascii.hexlify(c).decode() == crc:
+                matched = e["name"]
+                self.log(f"  データベース一致: 『{matched}』")
+                break
+
+        final = out if ok else out + ".unverified"
+        with open(final, "wb") as f:
+            f.write(rom)
+        self.log(f"保存: {final}")
+        if total_unresolved:
+            self.log(f"  未決着が {total_unresolved} バイト残っています。"
+                     f"サンプル数を増やして再実行すると、不足分だけ読み足します。")
+
+        if ok:
+            extra = f"\nデータベース一致: {matched}" if matched else ""
+            self.after(0, lambda: messagebox.showinfo(
+                "ダンプ成功", f"チェックサム一致。\nCRC32 = {crc}{extra}\n{final}"))
+        else:
+            self.after(0, lambda: messagebox.showwarning(
+                "チェックサム不一致",
+                f"検証を通らなかったため .unverified で保存しました。\n"
+                f"未決着 {total_unresolved} バイト\n{final}"))
+
+
+def _trend(diffs):
+    """相違の数が段階に対してどちらへ動いているかを返す。
+
+    「最後 > 最初」だけで増加と決めると、段階に反応しない（＝接触が原因の）カートが
+    ばらつきの偶然で Super FX と誤診される。**倍以上の変化があり、かつ途中で大きく
+    逆行していない**ことを両方求める。
+    """
+    if len(diffs) < 2:
+        return "flat"
+    if diffs[-1] * 2 <= diffs[0] and all(b <= a * 1.2 + 4 for a, b in zip(diffs, diffs[1:])):
+        return "down"
+    if diffs[0] * 2 <= diffs[-1] and all(b >= a * 0.8 - 4 for a, b in zip(diffs, diffs[1:])):
+        return "up"
+    return "flat"
+
+
+def _stack(samples):
+    import numpy as np
+    return np.stack([np.frombuffer(s, dtype=np.uint8) for s in samples])
 
 
 if __name__ == "__main__":
