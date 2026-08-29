@@ -133,8 +133,15 @@ def _read_bank_once(port, bank, tier, total_banks=0, cancel_flag=None, log=None,
 
 
 def read_bank_confirmed(port, bank, total_banks=0, start_idx=0,
-                        cancel_flag=None, log=None, progress=None, hold_reset=False):
+                        cancel_flag=None, log=None, progress=None, hold_reset=False,
+                        cart_clock=False, clock_ocr=1):
     """バンクを読み、2回連続で完全一致するまで繰り返す。
+
+    cart_clock=True でカートへクロックを供給しながら読む。SA-1カートに必要。
+    ファーム側は起動時にもクロックを出せるが(BOOT_CART_CLOCK_OCR)、**それでは等価に
+    ならない**ことが実測で分かっている。スーパーマリオRPGのバンク$C0を安全段階で
+    3回読むと、明示的に指定した場合は相違0、起動時クロックだけの場合は1〜2バイト
+    化けた。読み出し要求のたびに指定すること。
 
     start_idx で TIMING_TIERS の何番目から試すかを指定できる。前のバンクで分かって
     いる「このカートに必要な段階」から始めれば、毎回わざわざ通らないと分かっている
@@ -151,7 +158,8 @@ def read_bank_confirmed(port, bank, total_banks=0, start_idx=0,
             if cancel_flag is not None and cancel_flag.is_set():
                 return None, None, None
             data = _read_bank_once(port, bank, tier, total_banks, cancel_flag, log,
-                                   hold_reset=hold_reset)
+                                   hold_reset=hold_reset, cart_clock=cart_clock,
+                                   clock_ocr=clock_ocr)
             if data is None:
                 continue
             if progress:
