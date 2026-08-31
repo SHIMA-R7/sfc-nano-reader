@@ -45,6 +45,12 @@ def build():
         "--hidden-import", "bankio",
         "--hidden-import", "rdb",
         "--hidden-import", "contact_merge",
+        # 電源(DP100)とSA-1の起動読み。GUIは実行時にこれらを import する。
+        "--hidden-import", "dp100",
+        "--hidden-import", "sa1_wake",
+        "--hidden-import", "dump_sa1",
+        "--hidden-import", "hid",
+        "--hidden-import", "crcmod",
         "--distpath", os.path.join(ROOT, "dist"),
         "--workpath", os.path.join(ROOT, "build", "pyi"),
         "--specpath", os.path.join(ROOT, "build"),

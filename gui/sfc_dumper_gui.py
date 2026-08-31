@@ -36,6 +36,16 @@ if _HOST_DIR not in sys.path:
 from bankio import (BANK_SIZE, TIMING_TIERS, AdaptiveTiming,  # noqa: E402
                     read_bank_confirmed, _read_bank_once)
 
+# 電源(DP100)とSA-1の起動読みは追加機能。hidapi/crcmod が無い環境でも
+# GUI自体は動くべきなので、読み込めなければその欄だけ無効化する。
+try:
+    from dp100 import DP100, VMAX_MV          # noqa: E402
+    from sa1_wake import wake as sa1_wake     # noqa: E402
+    PSU_AVAILABLE, PSU_IMPORT_ERROR = True, None
+except Exception as _e:
+    DP100 = None; VMAX_MV = 5000; sa1_wake = None
+    PSU_AVAILABLE, PSU_IMPORT_ERROR = False, _e
+
 # 多数決マージは numpy を使う。入っていない環境でもGUI自体は動くべきなので、
 # 読み込めなければ「多数決」方式だけを無効化して、他の機能はそのまま使えるようにする。
 try:
@@ -214,8 +224,14 @@ class DumperApp(tk.Tk):
         self.db_hits = []
         self.db_size_bytes = None   # DBで選んだタイトルの実サイズ
         self.sram_bytes = 0         # 判定で読み取ったセーブ用SRAMの容量
+        self.psu = None             # DP100。使うときに開く
+        self.psu_lock = threading.Lock()
+        self.busy = False
 
         self._build_ui()
+        if PSU_AVAILABLE:
+            self._psu_open()
+        self._psu_poll()
         self.refresh_ports()
         self.after(100, self._drain_log)
         threading.Thread(target=self._load_db, daemon=True).start()
@@ -224,6 +240,68 @@ class DumperApp(tk.Tk):
             self.log("pyserial が見つかりません。`pip install pyserial` を実行してください。")
 
     # -- UI 構築 -------------------------------------------------
+
+    # -- 電源(DP100) -------------------------------------------------
+    # HIDの口は1本しかない。UIの定期読みとダンプ用スレッドが同時に叩くと
+    # フレームが混ざるので、必ず self.psu_lock で直列化する。
+
+    def _psu_open(self):
+        if not PSU_AVAILABLE:
+            return None
+        if self.psu is None:
+            try:
+                self.psu = DP100()
+            except Exception as e:
+                self.psu_status.set("見つかりません: %s" % e)
+                return None
+        return self.psu
+
+    def _psu_poll(self):
+        """1秒ごとに電圧・電流を読んで表示する。"""
+        if PSU_AVAILABLE and self.psu is not None and not self.busy:
+            try:
+                with self.psu_lock:
+                    s = self.psu.status(); c = self.psu.setting()
+                if s and c:
+                    self.psu_status.set("%.3f V / %.0f mA / %.2f W   出力=%s" % (
+                        s["vout_mV"] / 1000, s["iout_mA"],
+                        s["vout_mV"] * s["iout_mA"] / 1e6,
+                        "入" if c["state"] else "切"))
+            except Exception:
+                pass
+        self.after(1000, self._psu_poll)
+
+    def psu_on(self):
+        """**手順を崩さないこと。** 5Vを書く→読み戻して確認→入れる→実測を確認。"""
+        p = self._psu_open()
+        if p is None:
+            return
+        try:
+            with self.psu_lock:
+                c = p.apply(False, VMAX_MV, 1000)
+                if not c or c["vo_set_mV"] != VMAX_MV or c["state"] != 0:
+                    raise RuntimeError("5Vの設定を確認できません: %r" % (c,))
+                p.apply(True, VMAX_MV, 1000)
+                time.sleep(0.4)
+                s = p.status()
+                if s["vout_mV"] > 5300:
+                    p.apply(False, VMAX_MV, 1000)
+                    raise RuntimeError("出力が %.3f V と高すぎるため切りました" % (s["vout_mV"] / 1000))
+            self.log("電源ON %.3f V / %.0f mA" % (s["vout_mV"] / 1000, s["iout_mA"]))
+            self.after(2500, self.refresh_ports)   # Nanoが起きるのを待ってから再検索
+        except Exception as e:
+            messagebox.showerror("電源", str(e)); self.log("電源: %s" % e)
+
+    def psu_off(self):
+        p = self._psu_open()
+        if p is None:
+            return
+        try:
+            with self.psu_lock:
+                p.apply(False, VMAX_MV, 1000)
+            self.log("電源OFF")
+        except Exception as e:
+            messagebox.showerror("電源", str(e))
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 4}
@@ -236,6 +314,24 @@ class DumperApp(tk.Tk):
         self.port_combo = ttk.Combobox(conn, textvariable=self.port_var, width=38, state="readonly")
         self.port_combo.grid(row=0, column=1, sticky="w", pady=6)
         ttk.Button(conn, text="再検索", command=self.refresh_ports).grid(row=0, column=2, padx=6)
+
+        # 電源（DP100）
+        # リレーの代わり。5V専用のハードなので、GUIからも電圧は選ばせない。
+        psu = ttk.LabelFrame(self, text="電源 (Alientek DP100) — 5V固定")
+        psu.pack(fill="x", **pad)
+        self.psu_status = tk.StringVar(value="未接続")
+        ttk.Label(psu, textvariable=self.psu_status, width=42).grid(
+            row=0, column=0, sticky="w", padx=6, pady=6)
+        self.psu_on_btn = ttk.Button(psu, text="5Vを入れる", command=self.psu_on)
+        self.psu_on_btn.grid(row=0, column=1, padx=4)
+        self.psu_off_btn = ttk.Button(psu, text="切る", command=self.psu_off)
+        self.psu_off_btn.grid(row=0, column=2, padx=4)
+        ttk.Label(psu, text="※ このダンパーは5V専用です。GUIからは5V以外を出せません",
+                  foreground="#666").grid(row=0, column=3, sticky="w", padx=8)
+        if not PSU_AVAILABLE:
+            for b in (self.psu_on_btn, self.psu_off_btn):
+                b.config(state="disabled")
+            self.psu_status.set("使えません（hidapi/crcmod が必要）")
 
         # ファーム書き込み
         fw = ttk.LabelFrame(self, text="2. ファームウェア書き込み（各Nanoを1台ずつ接続して実行）")
@@ -324,6 +420,11 @@ class DumperApp(tk.Tk):
         self.identify_btn.pack(side="left")
         self.dump_btn = ttk.Button(btns, text="ダンプ開始", command=self.start_dump)
         self.dump_btn.pack(side="left", padx=6)
+        self.sa1_btn = ttk.Button(btns, text="SA-1カートを吸う（起動読み＋電源サイクル）",
+                                  command=self.start_sa1_dump)
+        self.sa1_btn.pack(side="left", padx=6)
+        if not PSU_AVAILABLE:
+            self.sa1_btn.config(state="disabled")
         self.cancel_btn = ttk.Button(btns, text="中止", command=self.cancel, state="disabled")
         self.cancel_btn.pack(side="left")
 
@@ -467,10 +568,13 @@ class DumperApp(tk.Tk):
                  f"(Nano-2 の NUM_BANKS も同じ値にして書き込み直してください)")
 
     def set_busy(self, busy):
+        self.busy = busy            # 電源の定期読みを止めるため（HIDの取り合いを避ける）
         state = "disabled" if busy else "normal"
         self.identify_btn.config(state=state)
         self.dump_btn.config(state=state)
         self.sram_btn.config(state=state)
+        if PSU_AVAILABLE:
+            self.sa1_btn.config(state=state)
         self.cancel_btn.config(state="normal" if busy else "disabled")
         if busy:
             self.sweep_btn.config(state="disabled")
@@ -623,6 +727,87 @@ class DumperApp(tk.Tk):
                 self.out_var.set(os.path.join(PROJECT_ROOT, safe + ".sfc"))
             self.query_var.set(hdr["title"])
             self.after(0, self.search_db)
+
+    # -- SA-1カート -------------------------------------------------
+
+    def start_sa1_dump(self):
+        """SA-1（マリオRPG / カービィSDX）を吸う。
+
+        普通のダンプと手順が違う。**いきなり64バンクを読みに行くと読めない。**
+        先に1バンクずつ短く読んで起こしてから、1接続で全64バンクを読み切る。
+        詳しくは host/sa1_wake.py と README を参照。
+        """
+        port = self.selected_port()
+        if not port:
+            return
+        out = self.out_var.get().strip()
+        if not out:
+            messagebox.showwarning("出力先", "保存先を選んでください。")
+            return
+        if self._psu_open() is None:
+            messagebox.showwarning("電源", "DP100が見つかりません。")
+            return
+        self.run_worker(lambda: self._dump_sa1(port, out))
+
+    def _dump_sa1(self, port, out, rounds=3):
+        from dump_sa1 import burst, rom_likeness, header_at, KNOWN
+        import serial.tools.list_ports as lp
+        T = (5, 5, 3)
+        for rnd in range(1, rounds + 1):
+            if self.cancel_flag.is_set():
+                self.log("中止しました。"); return
+            self.log("=== 挑戦 %d/%d ===" % (rnd, rounds))
+            self.status_var.set("電源を入れ直しています")
+            with self.psu_lock:
+                self.psu.apply(False, VMAX_MV, 1000)
+                time.sleep(6.0)
+                self.psu.apply(True, VMAX_MV, 1000)
+                time.sleep(0.5)
+                s = self.psu.status()
+                if s["vout_mV"] > 5300:
+                    self.psu.apply(False, VMAX_MV, 1000)
+                    self.log("出力が高すぎるため中止しました。"); return
+            self.log("電源 %.3f V / %.0f mA" % (s["vout_mV"] / 1000, s["iout_mA"]))
+            dl = time.time() + 30
+            while time.time() < dl and port not in [q.device for q in lp.comports()]:
+                time.sleep(0.4)
+            time.sleep(2.0)
+
+            self.status_var.set("起動読み（カートを起こしています）")
+            alive = sa1_wake(port, T, self.log)
+
+            self.status_var.set("64バンクを一気に読んでいます（約95秒）")
+            t0 = time.time()
+            rom = burst(port, 0xC0, 64, T, True, self.log)
+            if rom is None:
+                self.log("読み出しに失敗しました。"); continue
+            good = sum(1 for i in range(64)
+                       if rom_likeness(rom[i * BANK_SIZE:(i + 1) * BANK_SIZE])[0])
+            crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
+            self.log("%.0f秒 / CRC32 %s / 成立バンク %d/64" % (time.time() - t0, crc, good))
+            if good == 0:
+                self.log("施錠されています（%s）" % rom_likeness(rom[:BANK_SIZE])[1]); continue
+
+            # **バンク数だけで合格にしてはいけない。**
+            # CICが効いていないと、64/64が「ROMらしい」のに中身が3割違う回がある。
+            h = header_at(rom, 0x7FC0) or header_at(rom, 0xFFC0)
+            total = sum(rom) & 0xFFFF
+            if h:
+                self.log("ヘッダ『%s』期待0x%04x 計算0x%04x %s"
+                         % (h[0], h[1], total, "★一致" if total == h[1] else "**不一致**"))
+            if crc in KNOWN:
+                with open(out, "wb") as f:
+                    f.write(rom)
+                self.log("★ No-Intro一致『%s』 保存: %s" % (KNOWN[crc], out))
+                self.status_var.set("完了"); return
+            if h and total == h[1]:
+                with open(out, "wb") as f:
+                    f.write(rom)
+                self.log("総和は一致しましたが既知CRCと違います。保存: %s" % out)
+                self.status_var.set("完了（未照合）"); return
+            self.log("**検査に通りません。保存しません。** 次の回に賭けます")
+        self.log("読み切れませんでした。CIC認証のファームが載っているか確認してください。")
+        self.status_var.set("失敗")
 
     def start_sram_dump(self):
         port = self.selected_port()
