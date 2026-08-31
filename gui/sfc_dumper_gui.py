@@ -8,6 +8,7 @@ GUIだけで操作するためのアプリ。ブラウザ不要、Python標準�
 """
 
 import glob
+import json
 import os
 import queue
 import subprocess
@@ -83,6 +84,92 @@ ARDUINO_CLI_CANDIDATES = [
     os.path.expandvars(r"%LOCALAPPDATA%\Programs\arduino-ide\resources\app\lib\backend\resources\arduino-cli.exe"),
     "arduino-cli",
 ]
+
+
+# RetroArchの探索。**まずこのアプリからの相対で探す。**
+# 配布したときに、ツールとRetroArchを並べて置けばそのまま動くようにするため。
+# 見つからなければ既知の絶対パスを当たり、それでも駄目なら利用者に選んでもらう。
+RETROARCH_RELATIVE = [
+    "RetroArch",                          # 同梱（アプリの中に置いた）
+    os.path.join("..", "RetroArch"),      # 隣に置いた
+    os.path.join("..", "..", "RetroArch"),# 2つ上（exeを dist/ から動かす場合）
+    ".", "..",                            # RetroArchのフォルダに直接置いた
+]
+RETROARCH_ABSOLUTE = [
+    r"C:\RetroArch",
+    os.path.expandvars(r"%LOCALAPPDATA%\RetroArch"),
+    os.path.expandvars(r"%ProgramFiles%\RetroArch"),
+    os.path.expandvars(r"%ProgramFiles(x86)%\RetroArch"),
+]
+# 好みの順。上にあるものを優先する
+SNES_CORES = [
+    "snes9x_libretro.dll", "bsnes_libretro.dll", "bsnes_hd_beta_libretro.dll",
+    "snes9x2010_libretro.dll", "mesen-s_libretro.dll", "bsnes_mercury_balanced_libretro.dll",
+]
+NL = chr(10)   # ソースに改行のエスケープを直書きすると編集のたびに壊れるので定数にする
+CONFIG_PATH = os.path.join(os.path.expandvars(r"%LOCALAPPDATA%"), "sfc_dumper.json")
+
+
+def _app_dirs():
+    """探索の起点。frozen(exe)ならexeの場所、そうでなければプロジェクト直下。"""
+    d = [PROJECT_ROOT]
+    try:
+        d.append(os.path.dirname(os.path.abspath(sys.argv[0])))
+    except Exception:
+        pass
+    if getattr(sys, "frozen", False):
+        d.insert(0, os.path.dirname(sys.executable))
+    seen = []
+    for x in d:
+        if x and x not in seen:
+            seen.append(x)
+    return seen
+
+
+def find_retroarch():
+    """(retroarch.exe, SNESコア) を返す。見つからなければ (None, None)。"""
+    saved = _load_config().get("retroarch")
+    cands = []
+    if saved:
+        cands.append(saved)
+    for base in _app_dirs():
+        for rel in RETROARCH_RELATIVE:
+            cands.append(os.path.normpath(os.path.join(base, rel, "retroarch.exe")))
+    for a in RETROARCH_ABSOLUTE:
+        cands.append(os.path.join(a, "retroarch.exe"))
+    for exe in cands:
+        if exe and os.path.isfile(exe):
+            return exe, find_snes_core(os.path.dirname(exe))
+    return None, None
+
+
+def find_snes_core(ra_dir):
+    """RetroArchのcoresフォルダからSNESコアを1つ選ぶ。"""
+    for d in (os.path.join(ra_dir, "cores"), ra_dir):
+        if not os.path.isdir(d):
+            continue
+        names = {n.lower(): n for n in os.listdir(d)}
+        for want in SNES_CORES:
+            if want in names:
+                return os.path.join(d, names[want])
+    return None
+
+
+def _load_config():
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_config(**kv):
+    c = _load_config(); c.update(kv)
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+            json.dump(c, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 def find_arduino_cli():
@@ -265,6 +352,7 @@ class DumperApp(tk.Tk):
         self.db_size_bytes = None   # DBで選んだタイトルの実サイズ
         self.sram_bytes = 0         # 判定で読み取ったセーブ用SRAMの容量
         self.cart_header = None     # 判定で読んだヘッダ（搭載チップの判断に使う）
+        self.last_rom = None        # 直近に検証を通ったROM。プレイボタンが使う
         self.psu = None             # DP100。使うときに開く
         self.psu_lock = threading.Lock()
         self.busy = False
@@ -300,6 +388,52 @@ class DumperApp(tk.Tk):
         except Exception:
             pass
         self.destroy()
+
+    # -- プレイ (RetroArch) ------------------------------------------
+
+    def _set_last_rom(self, path):
+        """検証を通ったROMだけを覚える。**未検証(.unverified)は遊ばせない。**
+
+        今日、64/64バンクが「ROMらしい」のに中身が3割違うダンプを何度も見た。
+        検査を通っていないものをそのまま起動させると、動かない理由が分からなくなる。
+        """
+        self.last_rom = path
+        try:
+            self.play_btn.config(state="normal")
+        except Exception:
+            pass
+
+    def play_rom(self):
+        if not self.last_rom or not os.path.isfile(self.last_rom):
+            messagebox.showwarning("プレイ", "先にダンプを成功させてください。")
+            return
+        ra, core = find_retroarch()
+        if not ra:
+            messagebox.showinfo(
+                "RetroArchが見つかりません",
+                "retroarch.exe の場所を選んでください。" + NL + NL +
+                "このツールと同じ場所か、隣に RetroArch フォルダを置けば" + NL +
+                "次回から自動で見つかります。")
+            ra = filedialog.askopenfilename(title="retroarch.exe を選ぶ",
+                                            filetypes=[("RetroArch", "retroarch.exe")])
+            if not ra:
+                return
+            core = find_snes_core(os.path.dirname(ra))
+            _save_config(retroarch=ra)      # 次回から聞かない
+        if not core:
+            messagebox.showwarning(
+                "コアがありません",
+                "SNESのコアが見つかりません。" + NL +
+                "RetroArchのオンラインアップデータで snes9x を入れてください。")
+        self.log("RetroArchで起動します: %s" % os.path.basename(self.last_rom))
+        self.log("  コア: %s" % os.path.basename(core))
+        try:
+            # cwd をRetroArch側に置く。設定やアセットを相対で探すため。
+            subprocess.Popen([ra, "-L", core, self.last_rom],
+                             cwd=os.path.dirname(ra))
+        except Exception as e:
+            messagebox.showerror("起動できません", str(e))
+            self.log("起動できません: %s" % e)
 
     # -- 電源(DP100) -------------------------------------------------
     # HIDの口は1本しかない。UIの定期読みとダンプ用スレッドが同時に叩くと
@@ -493,6 +627,9 @@ class DumperApp(tk.Tk):
             self.sa1_btn.config(state="disabled")
         self.cancel_btn = ttk.Button(btns, text="中止", command=self.cancel, state="disabled")
         self.cancel_btn.pack(side="left")
+        self.play_btn = ttk.Button(btns, text="▶ プレイ (RetroArch)",
+                                   command=self.play_rom, state="disabled")
+        self.play_btn.pack(side="left", padx=(16, 0))
 
         # セーブデータ(SRAM)
         sram = ttk.LabelFrame(self, text="5. セーブデータ（バッテリーバックアップSRAM）")
@@ -874,6 +1011,7 @@ class DumperApp(tk.Tk):
                 with open(out, "wb") as f:
                     f.write(rom)
                 self.log("★ No-Intro一致『%s』 保存: %s" % (KNOWN[crc], out))
+                self.after(0, lambda: self._set_last_rom(out))
                 self.status_var.set("完了"); return
             if h and total == h[1]:
                 with open(out, "wb") as f:
@@ -1127,6 +1265,7 @@ class DumperApp(tk.Tk):
         self.log(f"保存: {final}")
 
         if ok:
+            self.after(0, lambda: self._set_last_rom(final))
             self.after(0, lambda: messagebox.showinfo(
                 "ダンプ成功", f"チェックサム一致。\nCRC32 = {crc}\n{final}"))
         else:
@@ -1494,6 +1633,7 @@ class DumperApp(tk.Tk):
                      f"サンプル数を増やして再実行すると、不足分だけ読み足します。")
 
         if ok:
+            self.after(0, lambda: self._set_last_rom(final))
             extra = f"\nデータベース一致: {matched}" if matched else ""
             self.after(0, lambda: messagebox.showinfo(
                 "ダンプ成功", f"チェックサム一致。\nCRC32 = {crc}{extra}\n{final}"))

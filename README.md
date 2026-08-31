@@ -833,6 +833,31 @@ python -c "from host.dp100 import DP100; p=DP100(); p.apply(False,5000,1000); p.
 **実際に効いた。** 初回接続時、DP100には **9.000V / 4.000A の設定が残っていた。**
 そのまま出力を入れていたら9Vがかかっていた。
 
+### プレイボタン（RetroArch連携）
+
+吸ったROMをそのままRetroArchで起動する「▶ プレイ (RetroArch)」を付けた。
+
+**検証を通ったROMだけ**が対象で、`.unverified` は遊べない。
+64/64バンクが「ROMらしい」のに中身が3割違うダンプを何度も見ているので、
+検査を通っていないものを起動させると、動かない理由が分からなくなる。
+
+#### 探し方（配布しても動くように）
+
+**まずこのアプリからの相対で探す。**
+
+    <アプリの場所>/RetroArch/retroarch.exe          同梱した場合
+    <アプリの場所>/../RetroArch/retroarch.exe       隣に置いた場合
+    <アプリの場所>/../../RetroArch/retroarch.exe    exeを dist/ に置いたまま動かす場合
+    <アプリの場所>/retroarch.exe                    RetroArchのフォルダに直接置いた場合
+
+見つからなければ C:\RetroArch / %LOCALAPPDATA% / Program Files を当たり、
+それでも駄目なら利用者に選んでもらう。選んだ場所は
+`%LOCALAPPDATA%\sfc_dumper.json` に覚えるので、次回から聞かない。
+
+コアは RetroArch の `cores/` から snes9x → bsnes → snes9x2010 → mesen-s の順に探す。
+起動は `retroarch.exe -L <コア> <ROM>` で、作業ディレクトリはRetroArch側に置く
+（設定やアセットを相対で探すため）。
+
 ### スーパーFXカートがHiROMと誤判定されていた（2026-08-31 修正）
 
 STAR FOX を連続読みしたら、こうなった。
