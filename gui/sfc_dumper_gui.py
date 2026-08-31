@@ -117,12 +117,26 @@ def extract_rom(raw, mapping):
     return bytes(out)
 
 
+# ヘッダ 0x16 の「カートリッジタイプ」。搭載チップが分かる。
+# スーパーFXカートは下位32KBにGSUが応答して独自データを返すため、
+# 「下位32KBに独自データ→HiROM」という判定を騙す。map_modeを信じること。
+CHIPSETS = {
+    0x00: "ROMのみ", 0x01: "ROM+RAM", 0x02: "ROM+RAM+電池",
+    0x03: "DSP", 0x04: "DSP+RAM", 0x05: "DSP+RAM+電池",
+    0x13: "スーパーFX (GSU)", 0x14: "スーパーFX+RAM",
+    0x15: "スーパーFX+RAM+電池", 0x1A: "スーパーFX (GSU-2)",
+    0x33: "SA-1", 0x34: "SA-1+RAM", 0x35: "SA-1+RAM+電池",
+    0xF3: "CX4", 0xF5: "S-DD1 / SPC7110", 0xF6: "SPC7110",
+}
+
+
 def read_header(rom, off):
     """指定オフセットのヘッダを読む。妥当そうなら dict、駄目なら None。"""
     if len(rom) < off + 32:
         return None
     title = rom[off:off + 21]
     map_mode = rom[off + 0x15]
+    rom_type = rom[off + 0x16]      # 搭載チップ
     rom_size_byte = rom[off + 0x17]
     sram_size_byte = rom[off + 0x18]
     complement = rom[off + 28] | (rom[off + 29] << 8)
@@ -135,6 +149,11 @@ def read_header(rom, off):
     return {
         "title": title.decode("shift_jis", errors="replace").strip(),
         "map_mode": map_mode,
+        "chipset": rom_type,
+        "chip_name": CHIPSETS.get(rom_type, "不明(0x%02X)" % rom_type),
+        "is_superfx": rom_type in (0x13, 0x14, 0x15, 0x1A),
+        "is_dsp": rom_type in (0x03, 0x04, 0x05),
+        "is_sa1": rom_type in (0x33, 0x34, 0x35),
         "size_kb": 1 << rom_size_byte if rom_size_byte < 20 else None,
         "sram_bytes": sram_bytes,
         "checksum": checksum,
@@ -142,23 +161,42 @@ def read_header(rom, off):
     }
 
 
-def detect_mapping(raw_bank0):
-    """バンク0の生データ(64KB)から (mapping, header) を判定する。
+MAP_MODE_NAMES = {0: "lorom", 1: "hirom", 2: "lorom", 3: "lorom", 5: "hirom"}
 
-    ヘッダの map_mode バイトだけを見ると誤りやすいので、まず下位32KBの状態で決める。
-    LoROMではROMが $8000-$FFFF にしか出ないため、下位32KBは
-    「上位のミラー」か「まったく駆動されず0x00」のどちらかになる。
-    HiROMは64KBフルに別データが載る。
+
+def detect_mapping(raw_bank0):
+    """バンク0の生データ(64KB)から (mapping, header, 根拠) を判定する。
+
+    ■ 以前は下位32KBの状態だけで決めていた。**これはスーパーFXで誤る。**
+    「LoROMなら下位32KBは上位のミラーか、駆動されず0x00になる」という前提だが、
+    スーパーFXカートはGSUが $0000-$7FFF に応答して独自データを返す。
+    その結果 STAR FOX (map_mode=0x20 = LoROM) をHiROMと誤判定し、
+    バンク数も抽出もずれて、チェックサムが合わないまま $C0 へ読み直しに行っていた。
+
+    ■ ヘッダが妥当なら map_mode を信じる
+    read_header はチェックサムと補数の関係を検査しているので、
+    通った時点でヘッダの位置は正しい。map_mode を疑う理由がない。
+    下位32KBの状態は、ヘッダが読めなかったときの最後の手段として残す。
+
+        map_mode の下位4bit  0,2 -> LoROM / 1,5 -> HiROM / 3 -> SA-1(LoROM系)
     """
     lo = raw_bank0[:BANK_SIZE // 2]
     hi = raw_bank0[BANK_SIZE // 2:]
     hdr = read_header(raw_bank0, 0xFFC0)
 
+    if hdr:
+        m = hdr["map_mode"] & 0x0F
+        if m in MAP_MODE_NAMES:
+            why = "ヘッダの map_mode=0x%02X" % hdr["map_mode"]
+            if hdr.get("chip_name"):
+                why += "（%s）" % hdr["chip_name"]
+            return MAP_MODE_NAMES[m], hdr, why
+
     if lo == hi:
-        return "lorom", hdr, "下位32KBが上位のミラー"
+        return "lorom", hdr, "下位32KBが上位のミラー（ヘッダが読めないため推定）"
     if not any(lo):
-        return "lorom", hdr, "下位32KBが全て0x00（駆動されていない）"
-    return "hirom", hdr, "下位32KBに独自データあり"
+        return "lorom", hdr, "下位32KBが全て0x00（ヘッダが読めないため推定）"
+    return "hirom", hdr, "下位32KBに独自データあり（ヘッダが読めないため推定）"
 
 
 def verify_checksum(rom, mapping):
@@ -226,6 +264,7 @@ class DumperApp(tk.Tk):
         self.db_hits = []
         self.db_size_bytes = None   # DBで選んだタイトルの実サイズ
         self.sram_bytes = 0         # 判定で読み取ったセーブ用SRAMの容量
+        self.cart_header = None     # 判定で読んだヘッダ（搭載チップの判断に使う）
         self.psu = None             # DP100。使うときに開く
         self.psu_lock = threading.Lock()
         self.busy = False
@@ -727,6 +766,14 @@ class DumperApp(tk.Tk):
         self.log(f"  タイトル『{hdr['title']}』")
         self.log(f"  map_mode=0x{hdr['map_mode']:02x} / ROMサイズ申告 {hdr['size_kb']} KB "
                  f"/ チェックサム 0x{hdr['checksum']:04x}")
+        self.log(f"  搭載チップ: {hdr['chip_name']}（0x{hdr['chipset']:02x}）")
+        self.cart_header = hdr          # ダンプ側が搭載チップを見るために覚えておく
+        if hdr["is_superfx"]:
+            self.log("  スーパーFXカートです。GSUが $0000-$7FFF に応答するため、"
+                     "下位32KBだけを見るとHiROMに誤判定されます。map_modeを優先します。")
+        if hdr["is_sa1"]:
+            self.log("  SA-1カートです。通常のダンプでは読めません。"
+                     "「SA-1カートを吸う」ボタンを使ってください。")
 
         self.mapping_var.set(mapping)
         self.sram_bytes = hdr["sram_bytes"]
@@ -1062,7 +1109,12 @@ class DumperApp(tk.Tk):
         # HiROMでチェックサムが合わないときは、DSP-1がバスを乗っ取っている疑いがある。
         # $00-$3F の $6000-$7FFF はDSP-1の応答になりROMが読めないが、$C0以降のミラーには
         # DSP-1が居ないので、そちらから読み直せば通る（スーパーマリオカートで実証済み）。
-        if not ok and mapping == "hirom" and start_bank == 0 and not self.cancel_flag.is_set():
+        # **DSP搭載カートに限る。** 以前は無条件で試していたため、
+        # スーパーFX(STAR FOX)でも $C0 を読みに行き、何も無いので
+        # 「ヘッダが読めない」まで走って50秒を捨てていた。
+        dsp = bool(getattr(self, "cart_header", None) and self.cart_header.get("is_dsp"))
+        if (not ok and mapping == "hirom" and start_bank == 0 and dsp
+                and not self.cancel_flag.is_set()):
             self.log("チェックサムが合いません。DSP-1搭載カートの可能性があるため、"
                      "$C0 から読み直します。")
             self.log("  （DSP-1は $00-$3F の $6000-$7FFF に居座るためROMが隠れます）")
