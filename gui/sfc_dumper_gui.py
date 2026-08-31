@@ -172,7 +172,9 @@ def verify_checksum(rom, mapping):
     off = 0xFFC0 if mapping == "hirom" else 0x7FC0
     hdr = read_header(rom, off)
     if not hdr:
-        return False, None, None, len(rom)
+        # ヘッダが読めなくても、計算値そのものは出せる。ここでNoneを返していたため
+        # 表示側が f"{computed:04x}" で落ちていた（2026-08-05から在った）。
+        return False, rom_sum(rom) & 0xFFFF, None, len(rom)
     for size in candidate_sizes(len(rom)):
         if size >= off + 32 and rom_sum(rom[:size]) & 0xFFFF == hdr["checksum"]:
             return True, hdr["checksum"], hdr["checksum"], size
@@ -227,11 +229,13 @@ class DumperApp(tk.Tk):
         self.psu = None             # DP100。使うときに開く
         self.psu_lock = threading.Lock()
         self.busy = False
+        self._closing = False    # 閉じたあとに after() が走らないように
 
         self._build_ui()
         if PSU_AVAILABLE:
             self._psu_open()
         self._psu_poll()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.refresh_ports()
         self.after(100, self._drain_log)
         threading.Thread(target=self._load_db, daemon=True).start()
@@ -240,6 +244,23 @@ class DumperApp(tk.Tk):
             self.log("pyserial が見つかりません。`pip install pyserial` を実行してください。")
 
     # -- UI 構築 -------------------------------------------------
+
+    def _on_close(self):
+        """閉じるときの後始末。
+
+        after() のループを止めてから破棄しないと、破棄済みウィジェットに対して
+        コールバックが走り "invalid command name" が出る。
+        DP100のHIDハンドルも開きっぱなしにしない（**出力は切らない**。
+        吸い出し中に閉じただけで給電が消えると、かえって危ない）。
+        """
+        self._closing = True
+        try:
+            if self.psu is not None:
+                with self.psu_lock:
+                    self.psu.close()
+        except Exception:
+            pass
+        self.destroy()
 
     # -- 電源(DP100) -------------------------------------------------
     # HIDの口は1本しかない。UIの定期読みとダンプ用スレッドが同時に叩くと
@@ -258,6 +279,8 @@ class DumperApp(tk.Tk):
 
     def _psu_poll(self):
         """1秒ごとに電圧・電流を読んで表示する。"""
+        if self._closing:
+            return
         if PSU_AVAILABLE and self.psu is not None and not self.busy:
             try:
                 with self.psu_lock:
@@ -269,7 +292,8 @@ class DumperApp(tk.Tk):
                         "入" if c["state"] else "切"))
             except Exception:
                 pass
-        self.after(1000, self._psu_poll)
+        if not self._closing:
+            self.after(1000, self._psu_poll)
 
     def psu_on(self):
         """**手順を崩さないこと。** 5Vを書く→読み戻して確認→入れる→実測を確認。"""
@@ -485,7 +509,8 @@ class DumperApp(tk.Tk):
                 self.log_text.config(state="disabled")
         except queue.Empty:
             pass
-        self.after(100, self._drain_log)
+        if not self._closing:
+            self.after(100, self._drain_log)
 
     def refresh_ports(self):
         if serial is None:
@@ -1013,9 +1038,12 @@ class DumperApp(tk.Tk):
         crc = format(zlib.crc32(rom) & 0xFFFFFFFF, "08x")
 
         self.log(f"合計 {len(rom)} bytes")
-        self.log(f"  チェックサム 計算値=0x{computed:04x} 期待値="
-                 f"{('0x%04x' % expected) if expected is not None else 'NA'} → "
-                 f"{'一致' if ok else '不一致'}")
+        cs = ("0x%04x" % computed) if computed is not None else "算出不可"
+        ex = ("0x%04x" % expected) if expected is not None else "**ヘッダが読めない**"
+        self.log(f"  チェックサム 計算値={cs} 期待値={ex} → {'一致' if ok else '不一致'}")
+        if expected is None:
+            self.log("  ヘッダが見つかりません。マッピング(LoROM/HiROM)の指定違い、"
+                     "バンク数の不足、カートの接触不良のどれかです。")
         self.log(f"  CRC32 = {crc}")
         if read_count:
             speed = (read_count * BANK_SIZE) / dump_elapsed / 1024
