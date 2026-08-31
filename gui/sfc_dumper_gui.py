@@ -392,6 +392,9 @@ class DumperApp(tk.Tk):
         ttk.Radiobutton(method_row, text="2回読んで一致するまで繰り返す（推奨・速い）",
                         value="confirm", variable=self.method_var,
                         command=self._on_method_change).pack(side="left")
+        ttk.Radiobutton(method_row, text="連続読み（最速・1バンクごとにリセットしない）",
+                        value="fast", variable=self.method_var,
+                        command=self._on_method_change).pack(side="left", padx=10)
         self.vote_radio = ttk.Radiobutton(
             method_row, text="多数決マージ（何度読んでも一致しないカート）",
             value="vote", variable=self.method_var, command=self._on_method_change)
@@ -931,6 +934,9 @@ class DumperApp(tk.Tk):
                 return
             self.run_worker(lambda: self._dump_vote(port, banks, mapping, out, samples))
             return
+        if self.method_var.get() == "fast":
+            self.run_worker(lambda: self._dump_fast(port, banks, mapping, out))
+            return
         self.run_worker(lambda: self._dump(port, banks, mapping, out))
 
     def _dump(self, port, banks, mapping, out, start_bank=0):
@@ -983,9 +989,21 @@ class DumperApp(tk.Tk):
             collected.append(data)
             read_count += 1
 
-        dump_elapsed = time.time() - dump_start
+        return self._finish_dump(
+            b"".join(collected), mapping, out, start_bank,
+            time.time() - dump_start, read_count,
+            retry=lambda sb: self._dump(port, banks, mapping, out, start_bank=sb))
 
-        rom = extract_rom(b"".join(collected), mapping)
+    def _finish_dump(self, raw, mapping, out, start_bank,
+                     dump_elapsed, read_count, retry=None):
+        """読み終わったバイト列を、検証して保存する。
+
+        バンクごと読みと連続読みで**まったく同じ検証を通す**ため共通化した。
+        2か所に同じ処理を書くと、いつか片方だけ直して食い違う。
+        retry は、チェックサムが合わないときに $C0 から読み直すための呼び出し。
+        """
+
+        rom = extract_rom(raw, mapping)
         ok, computed, expected, size = verify_checksum(rom, mapping)
         if ok and size != len(rom):
             self.log(f"実体は {size} bytes ({size // 1024}KB) でした。"
@@ -1020,7 +1038,8 @@ class DumperApp(tk.Tk):
             self.log("チェックサムが合いません。DSP-1搭載カートの可能性があるため、"
                      "$C0 から読み直します。")
             self.log("  （DSP-1は $00-$3F の $6000-$7FFF に居座るためROMが隠れます）")
-            return self._dump(port, banks, mapping, out, start_bank=0xC0)
+            if retry is not None:
+                return retry(0xC0)
 
         final = out if ok else out + ".unverified"
         with open(final, "wb") as f:
@@ -1034,6 +1053,54 @@ class DumperApp(tk.Tk):
             self.after(0, lambda: messagebox.showwarning(
                 "チェックサム不一致", f"検証を通らなかったため .unverified で保存しました。\n{final}"))
 
+
+    def _dump_fast(self, port, banks, mapping, out, start_bank=0, confirm=True):
+        """1接続で全バンクを続けて読む（バンクごとにリセットしない）。
+
+        ■ なぜ速いのか
+        バンクごと読みは1バンクごとにNanoをリセットして開き直す。
+        その待ちが支配的で、実測 9.5 KB/s しか出ない。
+        連続読みは接続を張ったまま流し込むので 44 KB/s 出る（4MBで95秒）。
+
+        ■ なぜ最初からこれにしなかったのか
+        昔はストローブを取りこぼして化けたため、1バンクずつ読み直す方式に逃げていた。
+        取りこぼしはピン変化割り込み(PCINT)で直っており、SA-1の連続読みが
+        実際に通ることで裏が取れた。**バンクごと読みは、もう回避策としては要らない。**
+
+        ■ 検証
+        既定では2回読んで完全一致を確認する（それでも従来より速い）。
+        一致しなければ化けているので、バンクごと読みに落とすよう促す。
+        """
+        from dump_sa1 import burst
+        t0 = time.time()
+        timing = TIMING_TIERS[0][:3]
+        self.status_var.set("連続読み（1回目）")
+        self.log(f"連続読み: バンク ${start_bank:02X} から {banks} バンクを一気に読みます")
+        raw = burst(port, start_bank, banks, timing, True, self.log)
+        if raw is None:
+            self.log("読み出しに失敗しました。ポートとファームを確認してください。")
+            return
+        read_count = banks
+        if confirm and not self.cancel_flag.is_set():
+            self.status_var.set("連続読み（2回目・照合）")
+            self.log("同じ範囲をもう一度読んで照合します")
+            raw2 = burst(port, start_bank, banks, timing, True, self.log)
+            if raw2 is None:
+                self.log("2回目が読めませんでした。照合できないので中止します。")
+                return
+            diff = sum(1 for a, b in zip(raw, raw2) if a != b)
+            read_count = banks * 2
+            if diff:
+                self.log(f"**2回の読み出しが {diff} バイト違います。** 保存しません。")
+                self.log("  接触かタイミングの問題です。"
+                         "「2回読んで一致するまで繰り返す」方式に切り替えてください。")
+                self.status_var.set("不一致")
+                return
+            self.log("2回の読み出しが完全に一致しました")
+        self._finish_dump(raw, mapping, out, start_bank,
+                          time.time() - t0, read_count,
+                          retry=lambda sb: self._dump_fast(port, banks, mapping, out,
+                                                           start_bank=sb, confirm=confirm))
 
     # -- タイミング掃引 ---------------------------------------------
 
