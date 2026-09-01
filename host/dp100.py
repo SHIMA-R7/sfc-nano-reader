@@ -65,31 +65,37 @@ class DP100:
     def __enter__(self):  return self
     def __exit__(self, *a): self.close()
 
-    def _xfer(self, op, data=b"", want=None, tries=6):
+    def _xfer(self, op, data=b"", want=None, tries=6, minlen=0):
+        """応答を1つ取る。
+
+        **minlen を必ず指定すること。** OP_BASICSET は書き込み後に
+        「状態1バイトだけ」の受領応答を返すことがあり、設定10バイトが来る保証がない。
+        長さを見ずに r[0] を読んで IndexError で落ち、実験が1本落ちた。
+        """
         for _ in range(tries):
             # **先頭のレポートID 0x00 が要る。** 無いと fa 00 00 01 (NONE) しか返らない。
             self.d.write(b'\x00' + _frame(op, data))
             time.sleep(0.06)
             r = _parse(self._read())
-            if r and (want is None or r[0] == want):
+            if r and (want is None or r[0] == want) and len(r[1]) >= minlen:
                 return r[1]
         return None
 
     def device_info(self):
-        r = self._xfer(OP_DEVICEINFO, want=OP_DEVICEINFO)
+        r = self._xfer(OP_DEVICEINFO, want=OP_DEVICEINFO, minlen=22)
         if not r: return None
         return {"type": r[0:15].split(b"\x00")[0].decode("utf-8", "replace"),
                 "hw": _u16(r,16)/10, "app": _u16(r,18)/10, "boot": _u16(r,20)/10}
 
     def status(self):
-        r = self._xfer(OP_BASICINFO, want=OP_BASICINFO)
+        r = self._xfer(OP_BASICINFO, want=OP_BASICINFO, minlen=16)
         if not r: return None
         return {"vin_mV":_u16(r,0), "vout_mV":_u16(r,2), "iout_mA":_u16(r,4),
                 "vo_max_mV":_u16(r,6), "temp_C":_u16(r,8)/10,
                 "out_mode":r[14], "work_st":r[15]}
 
     def setting(self):
-        r = self._xfer(OP_BASICSET, bytes([SET_ACT]), want=OP_BASICSET)
+        r = self._xfer(OP_BASICSET, bytes([SET_ACT]), want=OP_BASICSET, minlen=10)
         if not r: return None
         return {"index":r[0], "state":r[1], "vo_set_mV":_u16(r,2),
                 "io_set_mA":_u16(r,4), "ovp_mV":_u16(r,6), "ocp_mA":_u16(r,8)}
@@ -106,7 +112,12 @@ class DP100:
                    OVP_MV & 0xFF, (OVP_MV >> 8) & 0xFF, OCP_MA & 0xFF, (OCP_MA >> 8) & 0xFF])
         self._xfer(OP_BASICSET, d)
         time.sleep(0.15)
-        return self.setting()
+        # 受領応答が短いことがあるので、設定が読めるまで数回粘る
+        for _ in range(4):
+            c = self.setting()
+            if c: return c
+            time.sleep(0.1)
+        return None
 
     def output(self, on):
         s = self.setting() or {}
