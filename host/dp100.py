@@ -65,6 +65,24 @@ class DP100:
     def __enter__(self):  return self
     def __exit__(self, *a): self.close()
 
+    def _reopen(self):
+        """HIDを開き直す。**通信が落ちたまま黙って続けないため。**
+
+        2026-09-02、実験中に OSError: read error が出て、
+        **電源を切った直後に落ちて出力オフのまま止まった。**
+        6回の試行が1回も走らず、無人実行なら丸ごと無駄になっていた。
+        """
+        try:
+            self.d.close()
+        except Exception:
+            pass
+        time.sleep(0.3)
+        if hasattr(hid, "Device"):
+            self.d = hid.Device(VID, PID); self._legacy = False
+        else:
+            self.d = hid.device(); self.d.open(VID, PID); self._legacy = True
+            self.d.set_nonblocking(0)
+
     def _xfer(self, op, data=b"", want=None, tries=6, minlen=0):
         """応答を1つ取る。
 
@@ -72,13 +90,21 @@ class DP100:
         「状態1バイトだけ」の受領応答を返すことがあり、設定10バイトが来る保証がない。
         長さを見ずに r[0] を読んで IndexError で落ち、実験が1本落ちた。
         """
-        for _ in range(tries):
-            # **先頭のレポートID 0x00 が要る。** 無いと fa 00 00 01 (NONE) しか返らない。
-            self.d.write(b'\x00' + _frame(op, data))
-            time.sleep(0.06)
-            r = _parse(self._read())
-            if r and (want is None or r[0] == want) and len(r[1]) >= minlen:
-                return r[1]
+        for attempt in range(tries):
+            try:
+                # **先頭のレポートID 0x00 が要る。** 無いと fa 00 00 01 (NONE) しか返らない。
+                self.d.write(b'\x00' + _frame(op, data))
+                time.sleep(0.06)
+                r = _parse(self._read())
+                if r and (want is None or r[0] == want) and len(r[1]) >= minlen:
+                    return r[1]
+            except OSError:
+                # USBが一時的に落ちた。開き直して続ける。
+                # **最後まで駄目なら例外を上げる。黙って None を返してはいけない。**
+                # 呼び出し側が「設定できなかった」と「通信が落ちた」を区別できなくなる。
+                if attempt >= tries - 2:
+                    raise
+                self._reopen()
         return None
 
     def device_info(self):
