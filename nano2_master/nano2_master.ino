@@ -374,6 +374,24 @@ void pulseStrobeLong() {
 
 // バンク0の address に data を1バイト書く。
 // SA-1のレジスタ($2224/$2226/$2228)を叩くのが目的なので bank は0固定でよい。
+// Nano-3 にCIC認証をやり直させる。
+//
+// **バンクリセット線を長く保持するだけ。配線は増やさない。**
+// Nano-3側は「短い→バンクを0に戻す（従来）」「長い→加えて認証やり直し」で分けている。
+//
+// 認証は数十ms掛かり、その間 Nano-3 はバンクストローブを受け付けない。
+// **戻ってくるまで読み出しを始めてはいけない。** 余裕を見て待つ。
+const uint16_t REAUTH_HOLD_US = 1000;   // Nano-3 の閾値を確実に超える長さ
+const uint16_t REAUTH_WAIT_MS = 300;    // 認証と再初期化が終わるのを待つ
+
+void requestReauth() {
+  digitalWrite(BANK_RESET_PIN, HIGH);
+  delayMicroseconds(REAUTH_HOLD_US);
+  digitalWrite(BANK_RESET_PIN, LOW);
+  delay(REAUTH_WAIT_MS);
+  resetNano3Bank();          // 認証後の状態を揃えるため、通常のリセットを1回入れる
+}
+
 void writeCartByte(uint16_t address, uint8_t data) {
   // **バンク(A16-A23)を0に戻すのを忘れてはいけない。**
   // ここを抜かしたまま実装し、起動読みで $E0 を読んだ直後の状態から書いていたため、
@@ -655,6 +673,13 @@ void setup() {
     Serial.write('W');
     Serial.flush();
     return;                       // 読み出し経路には入らない
+  }
+
+  // ── CIC認証のやり直し（bit7）。読み出しの前に実行して、そのまま読み出しへ進む。
+  // 単独で使いたい場合は count(hdr[10]) を0にすれば認証だけで戻る。
+  if (hdr[8] & 0x80) {
+    requestReauth();
+    if (hdr[10] == 0) { Serial.write('A'); Serial.flush(); return; }
   }
 
   if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9], false);
