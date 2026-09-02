@@ -375,6 +375,11 @@ void pulseStrobeLong() {
 // バンク0の address に data を1バイト書く。
 // SA-1のレジスタ($2224/$2226/$2228)を叩くのが目的なので bank は0固定でよい。
 void writeCartByte(uint16_t address, uint8_t data) {
+  // **バンク(A16-A23)を0に戻すのを忘れてはいけない。**
+  // ここを抜かしたまま実装し、起動読みで $E0 を読んだ直後の状態から書いていたため、
+  // SA-1のレジスタがある $00:2224 ではなく $E0:2224 に書いていた。
+  // 「窓が開かない」のではなく、窓を開ける場所に書いていなかった。
+  resetNano3Bank();                       // A16-A23 = 0
   resetNano1Addr();                       // addr = 0
   for (uint16_t i = 0; i + 1 < address; i++) pulseStrobe();   // addr = address-1
   setDataPinsOutput(data);                // **ストローブより先に値を確定させる**
