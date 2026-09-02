@@ -37,13 +37,22 @@
 // Nano-1はPCと通信できない。知っているのはSTROBEとRESETのパルスだけである。
 // そこで**RESETのパルス幅**で意味を分ける。
 //
-//   短い(<WR_MIN_US) RESET → 従来どおりカウンタを0に戻す
-//   長い(>=WR_MIN_US) RESET → **カウンタは触らず、/WR を1パルス出す**
+//   立ち上がり           → **従来どおり即座にカウンタを0に戻す**
+//   立ち下がりで幅を判定  → 長ければ(>=WR_MIN_US) /WR を1パルス出す
 //
 // 通常運用のRESETは digitalWrite の直後に戻すので数マイクロ秒しかない。
 // 長いパルスは現れないので、取り違えない。
-// **アドレスを保ったまま書き込みを指示できる**のが要点で、
-// 「RESETを保持したままSTROBE」方式だとカウンタが0に戻ってしまい使えなかった。
+//
+// ■ **一度ここで読み出しを壊した（2026-09-02）**
+// 最初は「立ち上がりでは何もせず、立ち下がりで幅を見てリセットか/WRかを決める」
+// 設計にした。アドレスを保ったまま書き込めるので綺麗だと思ったが、
+// **リセットの実行が立ち下がりまで遅れる**ため、Nano-2がRESETを戻す前に
+// STROBEを打つとアドレスがずれた。マリオRPGで **0/6**（変更前は10/20）。
+//
+// **既存の読み出しを壊さないことを最優先にする。**
+// リセットは従来どおり立ち上がりで即実行し、/WR は立ち下がりで追加で出す。
+// その結果 /WR パルスの前にカウンタは0になるので、
+// **書き込み側はアドレスを毎回設定し直すこと。**
 
 const uint8_t ADDR_PINS[16] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, A0, A1, A2, A3};
 const uint8_t STROBE_PIN = A4;
@@ -92,15 +101,13 @@ ISR(PCINT1_vect) {
   last = now;
 
   if (rose & RESET_BIT) {
-    resetHighAt = (uint16_t)micros();   // まだ何もしない。幅を見てから決める
+    // **従来どおり即座にリセットする。ここを遅らせると読み出しが壊れる。**
+    addr = 0;
+    writeAddr(0);
+    resetHighAt = (uint16_t)micros();
   } else if (fell & RESET_BIT) {
-    const uint16_t held = (uint16_t)micros() - resetHighAt;
-    if (held >= WR_MIN_US) {
-      pulseWr();                        // 長い = 書き込み指示。**アドレスは触らない**
-    } else {
-      addr = 0;                         // 短い = 従来どおりのリセット
-      writeAddr(0);
-    }
+    // 幅が長ければ書き込み指示。リセットは既に済んでいる。
+    if ((uint16_t)((uint16_t)micros() - resetHighAt) >= WR_MIN_US) pulseWr();
   } else if (rose & STROBE_BIT) {
     writeAddr(++addr);
   }
