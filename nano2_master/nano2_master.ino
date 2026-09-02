@@ -322,6 +322,67 @@ bool sramMode = false;
 // sanniのMega構成では問題ないが、この配線で同じとは限らない。
 #define HOLD_STROBES_LOW 0
 
+// ══════════════════════════════════════════════════════════════════════
+// カートへの書き込み（SA-1のBW-RAM窓を開けるためのレジスタ書き込み用）
+//
+// **既定では絶対に動かない。** ホストが flags bit6(0x40) を立てたときだけ通る。
+// /WR を出すのは Nano-1 で、こちらは「長いストローブ」で指示する。
+//
+// ■ なぜ長いストローブなのか
+// Nano-1 はPCと通信できず、知っているのは STROBE と RESET だけ。
+// STROBE の立ち上がりでアドレスを+1したあと、まだHIGHのままなら書き込み指示、
+// という約束にしてある。**アドレスを進めた直後なので目的の番地に書ける。**
+// RESET幅で判定する案は、リセット直後でアドレスが必ず0になり使えなかった。
+//
+// ■ 手順
+//   1. RESET（短く）           addr = 0
+//   2. STROBE × (A-1) 回（短く） addr = A-1
+//   3. データバスを出力にして値を置く
+//   4. STROBE × 1 回（長く）    addr = A になり、その状態で /WR が出る
+//   5. データバスを入力に戻す
+//
+// ■ 守っていること
+//   ・データはストローブを上げる**前**に確定させる（/WRはISR内で即座に出るため）
+//   ・書き終わったら必ず入力に戻す。カートと出力がぶつかる時間を最小にする
+//   ・/ROMSEL は上げたまま（$2224 等は $8000 未満なのでROM領域ではない）
+// ══════════════════════════════════════════════════════════════════════
+
+// Nano-1 が「書き込み指示」と判定する閾値を確実に超える長さ。
+// Nano-1 側は WR_COUNT_MIN 回のループで判定しており、実測前なので余裕を取る。
+const uint16_t WRITE_STROBE_US = 200;
+
+void setDataPinsOutput(uint8_t value) {
+  // 先に値を確定させてから出力にする。出力にした瞬間に前の値が出ないように。
+  for (uint8_t i = 0; i < 6; i++) digitalWrite(DATA_LOW_PINS[i], (value >> i) & 1);
+  digitalWrite(D6_PIN, (value >> 6) & 1);
+  digitalWrite(D7_PIN, (value >> 7) & 1);
+  for (uint8_t i = 0; i < 6; i++) pinMode(DATA_LOW_PINS[i], OUTPUT);
+  pinMode(D6_PIN, OUTPUT);
+  pinMode(D7_PIN, OUTPUT);
+  // pinMode後にもう一度書く。INPUT時のdigitalWriteはプルアップ設定なので。
+  for (uint8_t i = 0; i < 6; i++) digitalWrite(DATA_LOW_PINS[i], (value >> i) & 1);
+  digitalWrite(D6_PIN, (value >> 6) & 1);
+  digitalWrite(D7_PIN, (value >> 7) & 1);
+}
+
+void pulseStrobeLong() {
+  STROBE_HIGH();
+  delayMicroseconds(WRITE_STROBE_US);   // Nano-1 がここで /WR を出す
+  STROBE_LOW();
+  delayMicroseconds(20);
+}
+
+// バンク0の address に data を1バイト書く。
+// SA-1のレジスタ($2224/$2226/$2228)を叩くのが目的なので bank は0固定でよい。
+void writeCartByte(uint16_t address, uint8_t data) {
+  resetNano1Addr();                       // addr = 0
+  for (uint16_t i = 0; i + 1 < address; i++) pulseStrobe();   // addr = address-1
+  setDataPinsOutput(data);                // **ストローブより先に値を確定させる**
+  if (addrSettleUs) delayMicroseconds(addrSettleUs);
+  pulseStrobeLong();                      // addr = address になり /WR が出る
+  setDataPinsInput();                     // **必ず入力へ戻す**
+}
+
 uint8_t readByte() {
 #if HOLD_STROBES_LOW
   // 制御線はsetup()でLowにしたまま。ここでは触らない。
@@ -571,6 +632,26 @@ void setup() {
   // hdr[9] はクロックの分周値(OCR2A)。16MHz/(2*(1+n)) が出力周波数になる。
   //   n=7 -> 1MHz / n=3 -> 2MHz / n=2 -> 2.67MHz / n=1 -> 4MHz / n=0 -> 8MHz
   // CICの公称は3.072MHzだが16MHzからは整数分周で作れないので、近い値を掃引して探す。
+  // ── 書き込みモード（bit6）。**既定では絶対に通らない経路。**
+  // SA-1のBW-RAM窓を開けるためのレジスタ書き込みに使う。
+  // ヘッダの解釈が読み出しと変わる:
+  //     hdr[0..1] : 書き込み先アドレス（下位, 上位）
+  //     hdr[2]    : 書き込む値
+  //     hdr[3]    : 繰り返し回数（1でよい。取りこぼし対策で増やせる）
+  // 応答は 'W' 1バイト。読み出しのようにデータは返さない。
+  if (hdr[8] & 0x40) {
+    const uint16_t waddr = (uint16_t)(hdr[0] | (hdr[1] << 8));
+    const uint8_t  wdata = hdr[2];
+    const uint8_t  wrep  = hdr[3] ? hdr[3] : 1;
+    sramMode = true;              // /ROMSEL を上げたままにする（$8000未満のため）
+    ROMSEL_HIGH();
+    for (uint8_t i = 0; i < wrep; i++) writeCartByte(waddr, wdata);
+    setDataPinsInput();           // 念のためもう一度
+    Serial.write('W');
+    Serial.flush();
+    return;                       // 読み出し経路には入らない
+  }
+
   if ((hdr[8] & 0x04) || cicMode) startCartClock(hdr[9], false);
 
   const bool laMode = (hdr[8] & 0x10) != 0;

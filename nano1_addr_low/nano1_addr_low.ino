@@ -37,8 +37,18 @@
 // Nano-1はPCと通信できない。知っているのはSTROBEとRESETのパルスだけである。
 // そこで**RESETのパルス幅**で意味を分ける。
 //
-//   立ち上がり           → **従来どおり即座にカウンタを0に戻す**
-//   立ち下がりで幅を判定  → 長ければ(>=WR_MIN_US) /WR を1パルス出す
+//   **STROBE** の立ち上がり → 従来どおり addr++。その直後、STROBEがHIGHのままかを
+//   ISR内で数え、長ければ /WR を1パルス出す。**アドレスは既に目的値になっている。**
+//   RESETは従来どおり（手を入れない）。
+//
+//   書き込み手順:
+//     RESET（短く）           addr = 0
+//     STROBE × (A-1) 回（短く） addr = A-1
+//     データバスに値を出す
+//     STROBE × 1 回（長く）    addr = A になり、その状態で /WR が出る
+//
+//   **RESETの幅で判定する案は使えなかった。** リセット直後はアドレスが必ず0で、
+//   アドレス0にしか書けない仕組みになる。
 //
 // 通常運用のRESETは digitalWrite の直後に戻すので数マイクロ秒しかない。
 // 長いパルスは現れないので、取り違えない。
@@ -64,7 +74,11 @@ const uint8_t RESET_PIN = A5;
 
 // これ以上RESETがHIGHなら「書き込み指示」とみなす。
 // 通常のRESETパルスは数us。50usなら誤認しない。
-const uint16_t WR_MIN_US = 50;
+// ISR内でSTROBEのHIGH保持を数える回数。1周は数命令。
+//   160回 ≒ 50us  … これ以上なら「書き込み指示」
+//   640回 ≒ 200us … 上限。異常に長い場合に抜けるため
+const uint16_t WR_COUNT_MIN = 160;
+const uint16_t WR_COUNT_MAX = 640;
 // /WR をLOWに保つ幅は pulseWr() のNOP数で決める（約4us）。
 // SRAMの書き込みパルスは普通100ns未満で足りるが、経路にNanoが挟まるので余裕を取る。
 
@@ -94,22 +108,22 @@ static inline void pulseWr() {
 // PCINT1 は PORTC の変化でまとめて呼ばれる。立ち上がりと立ち下がりの両方を見る。
 ISR(PCINT1_vect) {
   static uint8_t last = 0;
-  static uint16_t resetHighAt = 0;     // RESETが立ち上がった時刻(us)
   const uint8_t now = PINC & (STROBE_BIT | RESET_BIT);
   const uint8_t rose = (uint8_t)(now & ~last);
-  const uint8_t fell = (uint8_t)(~now & last);
   last = now;
 
   if (rose & RESET_BIT) {
-    // **従来どおり即座にリセットする。ここを遅らせると読み出しが壊れる。**
+    // リセットは従来どおり。**ここには一切手を入れない。**
     addr = 0;
     writeAddr(0);
-    resetHighAt = (uint16_t)micros();
-  } else if (fell & RESET_BIT) {
-    // 幅が長ければ書き込み指示。リセットは既に済んでいる。
-    if ((uint16_t)((uint16_t)micros() - resetHighAt) >= WR_MIN_US) pulseWr();
   } else if (rose & STROBE_BIT) {
     writeAddr(++addr);
+    // アドレスを更新した「あと」に、STROBEがHIGHのままかを数える。
+    // 長ければ書き込み指示。**このときアドレスは既に目的値になっている。**
+    // RESET幅で判定する案は、リセット直後なのでアドレスが必ず0になり使えなかった。
+    uint16_t n = 0;
+    while ((PINC & STROBE_BIT) && n < WR_COUNT_MAX) n++;
+    if (n >= WR_COUNT_MIN) pulseWr();
   }
 }
 
@@ -123,11 +137,16 @@ void setup() {
   pinMode(RESET_PIN, INPUT);
   writeAddr(0);
 
-  // millis()用のタイマ割り込みはISRの応答を遅らせるだけなので止める…
-  // **としていたが、micros() を使うようになったので Timer0 は生かす。**
-  // ISRの中で micros() を呼ぶが、Timer0のオーバーフロー割り込みは
-  // PCINT1より優先度が低く、ISR内では割り込み禁止なので競合しない。
-  // 桁上がりを1回取りこぼす可能性はあるが、判定は50us対数usの粗い比較なので影響しない。
+  // millis()用のタイマ割り込みはISRの応答を遅らせるだけなので止める（delay/millis不使用）
+  //
+  // **ここを一度外して読み出しを壊した（2026-09-02）。**
+  // RESETの幅を測るのに micros() を使いたくて TIMSK0=0 を消したところ、
+  // マリオRPGが 0/6 になった（元は10/20）。
+  // 「ISR内では割り込み禁止だから競合しない」と考えたのは誤りで、
+  // **問題はISRの中ではなくISRが始まるまでの遅延**である。
+  // Timer0のISRが実行中にSTROBEが来ると、その処理が終わるまでアドレス更新が待たされる。
+  // 元のコメントは正しかった。理由を誤解して外した。
+  TIMSK0 = 0;
 
   // PORTC のピン変化割り込みを A4/A5 だけ有効にする
   PCICR |= _BV(PCIE1);
